@@ -1,2 +1,9 @@
 output
 *.pyc
+!*.h
+!*.c
+!*.md
+!*.txt
+!*.pdf
+!*.docx
+!*.rst

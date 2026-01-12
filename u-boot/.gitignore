@@ -87,3 +87,11 @@ GTAGS
 *.orig
 *~
 \#*#
+
+!*.h
+!*.c
+!*.md
+!*.txt
+!*.pdf
+!*.docx
+!*.rst
