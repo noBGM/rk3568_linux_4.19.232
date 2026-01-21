@@ -1,0 +1,8 @@
+!*.h
+!*.c
+!*.md
+!*.txt
+!*.pdf
+!*.docx
+!*.rst
+!.gitignore
