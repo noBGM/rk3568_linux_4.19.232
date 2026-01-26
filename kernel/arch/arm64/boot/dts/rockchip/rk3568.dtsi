@@ -2236,47 +2236,71 @@
 		status = "disabled";
 	};
 
+	// RK3568 动态内存控制器(DMC)配置节点：负责DDR内存的动态调频和功耗管理
 	dmc: dmc {
+		// 兼容属性：匹配Linux内核中RK3568 DMC对应的驱动程序
 		compatible = "rockchip,rk3568-dmc";
+		// 中断配置：GIC SPI中断10，高电平触发，用于DMC频率切换完成后的中断通知
 		interrupts = <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH>;
+		// 中断名称：标识该中断为"频率切换完成"中断
 		interrupt-names = "complete";
+		// 性能监控事件源：关联DFI(DDR频率接口)和NOC_CPU(CPU总线)，用于采集带宽/负载数据
 		devfreq-events = <&dfi>, <&nocp_cpu>;
+		// 时钟源：指定DMC使用scmi_clk时钟控制器的第3路时钟
 		clocks = <&scmi_clk 3>;
+		// 时钟名称：标识该时钟为DMC核心工作时钟
 		clock-names = "dmc_clk";
+		// 功耗性能点表：关联DMC的OPP表(频率-电压对照表)，不同频率对应不同供电电压
 		operating-points-v2 = <&dmc_opp_table>;
+
+		// VOP(显示输出模块)带宽对应的DMC频率映射表
 		vop-bw-dmc-freq = <
 		/* min_bw(MB/s) max_bw(MB/s) freq(KHz) */
-			0	286	324000
-			287	99999	528000
+			0	286	324000  // VOP带宽0~286MB/s → DDR频率324MHz
+			287	99999	528000 // VOP带宽287MB/s以上 → DDR频率528MHz
 		>;
+
+		// VOP帧缓冲(画面渲染)带宽对应的DMC频率映射表
 		vop-frame-bw-dmc-freq = <
 		/* min_bw(MB/s) max_bw(MB/s) freq(KHz) */
-			0	620	324000
-			621	99999	780000
+			0	620	324000  // 帧缓冲带宽0~620MB/s → DDR频率324MHz
+			621	99999	780000 // 帧缓冲带宽621MB/s以上 → DDR频率780MHz
 		>;
+
+		// CPU总线带宽对应的DMC频率映射表(分三级)
 		cpu-bw-dmc-freq = <
 		/* min_bw(MB/s) max_bw(MB/s) freq(KHz) */
-			0	350	324000
-			351	400	528000
-			401	99999	780000
+			0	350	324000  // CPU带宽0~350MB/s → DDR频率324MHz
+			351	400	528000  // CPU带宽351~400MB/s → DDR频率528MHz
+			401	99999	780000 // CPU带宽401MB/s以上 → DDR频率780MHz
 		>;
+
+		// 升频阈值：当带宽使用率超过40%时，触发DDR升频
 		upthreshold = <40>;
+		// 降频差值：仅当带宽使用率比升频阈值低20%(即<20%)时才降频，避免频繁调频
 		downdifferential = <20>;
+
+		// 系统状态与DMC频率等级绑定表：不同场景强制使用指定频率等级
 		system-status-level = <
 			/*system status         freq level*/
-			SYS_STATUS_NORMAL       DMC_FREQ_LEVEL_MID_HIGH
-			SYS_STATUS_REBOOT       DMC_FREQ_LEVEL_HIGH
-			SYS_STATUS_SUSPEND      DMC_FREQ_LEVEL_LOW
-			SYS_STATUS_VIDEO_4K     DMC_FREQ_LEVEL_MID_HIGH
-			SYS_STATUS_VIDEO_4K_10B DMC_FREQ_LEVEL_MID_HIGH
-			SYS_STATUS_BOOST        DMC_FREQ_LEVEL_HIGH
-			SYS_STATUS_ISP          DMC_FREQ_LEVEL_HIGH
-			SYS_STATUS_PERFORMANCE  DMC_FREQ_LEVEL_HIGH
-			SYS_STATUS_DUALVIEW     DMC_FREQ_LEVEL_HIGH
+			SYS_STATUS_NORMAL       DMC_FREQ_LEVEL_MID_HIGH  // 正常状态 → 中高频
+			SYS_STATUS_REBOOT       DMC_FREQ_LEVEL_HIGH      // 重启状态 → 高频(保证稳定性)
+			SYS_STATUS_SUSPEND      DMC_FREQ_LEVEL_LOW       // 休眠状态 → 低频(省电)
+			SYS_STATUS_VIDEO_4K     DMC_FREQ_LEVEL_MID_HIGH  // 4K视频播放 → 中高频
+			SYS_STATUS_VIDEO_4K_10B DMC_FREQ_LEVEL_MID_HIGH  // 4K 10bit视频播放 → 中高频
+			SYS_STATUS_BOOST        DMC_FREQ_LEVEL_HIGH      // 性能BOOST模式 → 高频
+			SYS_STATUS_ISP          DMC_FREQ_LEVEL_HIGH      // ISP摄像头图像处理 → 高频
+			SYS_STATUS_PERFORMANCE  DMC_FREQ_LEVEL_HIGH      // 性能模式 → 高频
+			SYS_STATUS_DUALVIEW     DMC_FREQ_LEVEL_HIGH      // 双屏显示 → 高频
 		>;
+
+		// 自动调频最低频率：DDR自动调速时的下限为324KHz(实际为324MHz，单位标注习惯)
 		auto-min-freq = <324000>;
+		// 自动调频使能：1=开启DDR动态调频功能，0=禁用
 		auto-freq-en = <1>;
+		// 散热框架参数：用于thermal散热管理，2个参数(类型+降频幅度)，温度过高时降频降温
 		#cooling-cells = <2>;
+		// 初始状态：disabled=默认禁用(内核可运行时改为okay启用)
 		status = "disabled";
 	};
 

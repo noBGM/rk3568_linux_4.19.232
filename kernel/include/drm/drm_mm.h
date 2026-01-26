@@ -176,38 +176,95 @@ struct drm_mm_node {
 };
 
 /**
- * struct drm_mm - DRM allocator
+ * struct drm_mm - DRM内存管理器核心结构体
  *
- * DRM range allocator with a few special functions and features geared towards
- * managing GPU memory. Except for the @color_adjust callback the structure is
- * entirely opaque and should only be accessed through the provided functions
- * and macros. This structure can be embedded into larger driver structures.
+ * 专用于GPU内存管理的地址范围分配器，提供内存块的分配/释放、区间查找等功能，
+ * 针对GPU内存的特殊需求（如物理地址连续、按颜色/大小分类、插入保护页等）做了优化。
+ * 除@color_adjust回调外，其余成员均为私有（opaque），仅能通过DRM提供的API访问，
+ * 该结构体可嵌入到驱动的更大结构体中使用。
+ */
+
+ /*
+ 总结
+struct drm_mm 是 DRM 子系统GPU 内存分配的核心管理器，通过链表 + 红黑树（区间树）实现高效的内存块分配 / 释放；
+核心设计亮点：
+hole_stack/holes_size/holes_addr 多维度索引空闲空洞，兼顾分配效率；
+interval_tree 实现地址快速查找，适配 GPU 内存地址管理需求；
+color_adjust 回调允许驱动自定义内存分配规则（如保护页、对齐）；
+私有成员（hole_stack/head_node等）禁止驱动直接修改，必须通过 DRM 提供的 API（如 drm_mm_alloc ()、drm_mm_free ()）操作，避免破坏内存结构。
  */
 struct drm_mm {
 	/**
-	 * @color_adjust:
+	 * @color_adjust: 内存空洞（hole）限制调整的驱动回调函数
 	 *
-	 * Optional driver callback to further apply restrictions on a hole. The
-	 * node argument points at the node containing the hole from which the
-	 * block would be allocated (see drm_mm_hole_follows() and friends). The
-	 * other arguments are the size of the block to be allocated. The driver
-	 * can adjust the start and end as needed to e.g. insert guard pages.
+	 * 可选回调，驱动可通过此函数对内存空洞施加额外限制。分配内存块时，
+	 * node参数指向待分配空洞对应的drm_mm_node节点（可通过drm_mm_hole_follows()等函数获取），
+	 * color为内存块的"颜色"标识（用于分类管理内存，如不同缓存属性/权限），
+	 * start/end为待分配块的起始/结束地址指针，驱动可修改这两个值（如插入保护页、
+	 * 调整对齐方式），实现自定义的内存分配规则。
+	 *
+	 * 函数参数说明：
+	 * @node: 待分配空洞对应的节点
+	 * @color: 待分配内存块的颜色标识
+	 * @start: 待分配块起始地址（入参为候选值，驱动可修改）
+	 * @end: 待分配块结束地址（入参为候选值，驱动可修改）
 	 */
 	void (*color_adjust)(const struct drm_mm_node *node,
 			     unsigned long color,
 			     u64 *start, u64 *end);
 
-	/* private: */
-	/* List of all memory nodes that immediately precede a free hole. */
+	/* private: */ // 以下均为私有成员，禁止驱动直接访问
+	/**
+	 * @hole_stack: 内存空洞前驱节点链表头
+	 *
+	 * 存储所有"紧邻内存空洞"的内存节点链表，每个节点都指向一个空闲空洞的起始位置，
+	 * 用于快速定位可分配的内存空洞，提升分配效率。
+	 * 注释原文：List of all memory nodes that immediately precede a free hole.
+	 */
 	struct list_head hole_stack;
-	/* head_node.node_list is the list of all memory nodes, ordered
-	 * according to the (increasing) start address of the memory node. */
+
+	/**
+	 * @head_node: 内存节点链表的根节点
+	 *
+	 * head_node.node_list 是所有内存节点（包括已分配/空闲）的链表头，
+	 * 链表节点按内存起始地址**递增**排序，是遍历所有内存节点的入口。
+	 * 注释原文：head_node.node_list is the list of all memory nodes, ordered
+	 * according to the (increasing) start address of the memory node.
+	 */
 	struct drm_mm_node head_node;
-	/* Keep an interval_tree for fast lookup of drm_mm_nodes by address. */
+
+	/**
+	 * @interval_tree: 按地址索引的区间树（缓存版）
+	 *
+	 * 基于红黑树实现的区间树，用于通过内存地址**快速查找**对应的drm_mm_node节点，
+	 * 相比遍历链表，区间树可将查找复杂度从O(n)降至O(log n)，核心用于地址冲突检测、
+	 * 节点定位等场景。
+	 * 注释原文：Keep an interval_tree for fast lookup of drm_mm_nodes by address.
+	 */
 	struct rb_root_cached interval_tree;
+
+	/**
+	 * @holes_size: 按大小索引的空闲空洞红黑树（缓存版）
+	 *
+	 * 所有空闲内存空洞按"大小"排序的红黑树（缓存版），用于快速查找符合大小要求的空洞，
+	 * 是内存分配时"按大小匹配"的核心数据结构。
+	 */
 	struct rb_root_cached holes_size;
+
+	/**
+	 * @holes_addr: 按地址索引的空闲空洞红黑树
+	 *
+	 * 所有空闲内存空洞按"起始地址"排序的红黑树，用于快速查找指定地址范围内的空洞，
+	 * 补充holes_size的功能，满足"按地址分配"的场景需求。
+	 */
 	struct rb_root holes_addr;
 
+	/**
+	 * @scan_active: 内存扫描激活标记
+	 *
+	 * 用于标记当前是否正在进行内存节点/空洞的扫描操作（如遍历所有空洞查找匹配项），
+	 * 防止扫描过程中内存结构被并发修改，保证操作原子性。
+	 */
 	unsigned long scan_active;
 };
 

@@ -104,16 +104,65 @@ struct iommu_pgtbl_info {
 
 
 #define IOMMU_DOMAIN_NAME_LEN 32
+/**
+ * struct iommu_domain - IOMMU域的核心描述结构体
+ * 作用：代表一个独立的IOMMU地址空间（域），用于管理设备的DMA地址转换、
+ *       页大小、故障处理、地址空间几何特性等核心参数，是IOMMU子系统的核心数据结构。
+ */
 struct iommu_domain {
+	/**
+	 * @type: IOMMU域的类型标识
+	 * 取值（常见）：
+	 * - IOMMU_DOMAIN_UNMANAGED: 无管理的域（手动配置页表）
+	 * - IOMMU_DOMAIN_DMA: DMA地址转换域（内核自动管理页表）
+	 * - IOMMU_DOMAIN_IOVA: 支持IOVA（IO虚拟地址）的域
+	 * - IOMMU_DOMAIN_SVA: 共享虚拟地址域（设备与CPU共享地址空间）
+	 */
 	unsigned type;
+
+	/**
+	 * @ops: 指向该IOMMU域对应的操作函数集
+	 * 包含域的创建/销毁、映射/解除映射、页表操作等核心方法，由具体的IOMMU驱动（如ARM SMMU、AMD IOMMU）实现
+	 */
 	const struct iommu_ops *ops;
-	unsigned long pgsize_bitmap;	/* Bitmap of page sizes in use */
+
+	/**
+	 * @pgsize_bitmap: 该域支持的页大小位图
+	 * 每一位代表一种支持的页大小（如4K、2M、1G），bit位为1表示对应页大小可用
+	 * 示例：BIT(12) 表示支持4K页（2^12=4096），BIT(21) 表示支持2M页（2^21=2097152）
+	 * 注释原文：Bitmap of page sizes in use（当前使用的页大小位图）
+	 */
+	unsigned long pgsize_bitmap;
+
+	/**
+	 * @handler: IOMMU故障（fault）处理回调函数
+	 * 当设备发起的DMA访问触发页错误、权限错误等故障时，内核会调用该回调函数
+	 * 函数原型：typedef int (*iommu_fault_handler_t)(struct iommu_fault *, void *);
+	 */
 	iommu_fault_handler_t handler;
+
+	/**
+	 * @handler_token: 传递给故障处理回调函数的私有数据
+	 * 可用于传递设备指针、域的私有上下文等，避免全局变量，提升代码灵活性
+	 */
 	void *handler_token;
+
+	/**
+	 * @geometry: 该IOMMU域的地址空间几何特性描述
+	 * 包含：
+	 * - 最小/最大IO虚拟地址（IOVA）范围
+	 * - 页大小限制
+	 * - 地址转换的位宽限制等
+	 * 用于约束该域的地址空间范围和转换规则
+	 */
 	struct iommu_domain_geometry geometry;
+
+	/**
+	 * @iova_cookie: IOVA（IO虚拟地址）管理的私有数据
+	 * 由具体的IOVA分配器（如libiova）使用，存储IOVA地址池、分配状态等信息
+	 * 仅在type为IOMMU_DOMAIN_IOVA时有效
+	 */
 	void *iova_cookie;
-	bool is_debug_domain;
-	char name[IOMMU_DOMAIN_NAME_LEN];
 };
 
 enum iommu_cap {

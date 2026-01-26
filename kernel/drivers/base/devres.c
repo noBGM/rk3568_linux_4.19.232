@@ -34,6 +34,35 @@ struct devres {
 	u8 __aligned(ARCH_KMALLOC_MINALIGN) data[];
 };
 
+/**
+ * struct devres_group - devres 资源分组结构体
+ * @node: 双节点数组，用于在 devres 链表中标记分组边界
+ *        node[0]: 分组开始标记，在 devres_open_group() 时插入链表
+ *        node[1]: 分组结束标记，在 devres_close_group() 时插入链表
+ * @id: 分组唯一标识符，用于查找和操作特定分组
+ *      可以是用户自定义的指针（如驱动私有结构体地址），
+ *      或者为 NULL 时使用分组自身地址作为 ID
+ * @color: 分组状态标记，用于释放算法中判断分组完整性
+ *         在 remove_nodes() 中使用：
+ *         - color = 1: 只找到开始标记（开放的分组，不释放）
+ *         - color = 2: 开始和结束标记都在范围内（完整分组，可释放）
+ *
+ * 核心设计思想：
+ * devres_group 通过双节点在 devres 链表中插入"括号式"标记，将一组相关
+ * 资源包裹起来。这样可以实现：
+ * 1. 选择性批量释放：只释放特定分组内的资源
+ * 2. 精确的错误回退：初始化失败时只撤销部分已完成的操作
+ * 3. 嵌套分组支持：内层分组可以独立释放或随外层分组一起释放
+ *
+ * 使用场景示例：
+ *   id = devres_open_group(dev, NULL, GFP_KERNEL);
+ *   mem = devm_kzalloc(dev, size, GFP_KERNEL);  // 属于这个分组
+ *   irq = devm_request_irq(dev, ...);            // 属于这个分组
+ *   devres_close_group(dev, id);
+ *   
+ *   if (test_failed())
+ *       devres_release_group(dev, id);  // 只释放上面申请的 mem 和 irq
+ */
 struct devres_group {
 	struct devres_node		node[2];
 	void				*id;
@@ -541,28 +570,55 @@ int devres_release_all(struct device *dev)
  * RETURNS:
  * ID of the new group, NULL on failure.
  */
+/**
+ * devres_open_group - 打开一个新的资源分组
+ * @dev: 要创建分组的设备
+ * @id: 分组标识符（NULL 则使用分组自身地址）
+ * @gfp: 内存分配标志
+ *
+ * 创建一个资源分组，后续申请的 devres 资源会关联到这个分组。
+ * 分组可以稍后通过 devres_close_group() 关闭，然后用
+ * devres_release_group() 批量释放组内所有资源。
+ *
+ * 典型使用流程：
+ *   id = devres_open_group(dev, NULL, GFP_KERNEL);
+ *   // 申请资源（会自动关联到分组）
+ *   mem = devm_kzalloc(dev, size, GFP_KERNEL);
+ *   devres_close_group(dev, id);
+ *   // 如果初始化失败，批量释放
+ *   if (error) devres_release_group(dev, id);
+ *
+ * 返回: 分组 ID（成功）或 NULL（失败）
+ */
 void * devres_open_group(struct device *dev, void *id, gfp_t gfp)
 {
 	struct devres_group *grp;
 	unsigned long flags;
 
 	grp = kmalloc(sizeof(*grp), gfp);
-	if (unlikely(!grp))
+	if (unlikely(!grp))  // unlikely优化分支预测，标记内存分配失败为小概率场景
 		return NULL;
 
+	/* 初始化双节点：node[0] 标记分组开始，node[1] 用于标记结束 */
 	grp->node[0].release = &group_open_release;
 	grp->node[1].release = &group_close_release;
 	INIT_LIST_HEAD(&grp->node[0].entry);
 	INIT_LIST_HEAD(&grp->node[1].entry);
-	set_node_dbginfo(&grp->node[0], "grp<", 0);
-	set_node_dbginfo(&grp->node[1], "grp>", 0);
-	grp->id = grp;
-	if (id)
+
+	// 4. 设置节点调试信息（内核调试用，标识节点为分组类型）
+	set_node_dbginfo(&grp->node[0], "grp<", 0);  // node0标记为分组开始
+	set_node_dbginfo(&grp->node[1], "grp>", 0);  // node1标记为分组结束
+
+	// 5. 初始化分组ID：优先使用用户自定义ID，无则用分组自身地址
+	grp->id = grp;  // 默认ID：分组结构体的内存地址（天然唯一）
+	if (id)         // 覆盖默认值，使用用户传入的自定义ID
 		grp->id = id;
 
+	/* 将开始标记（node[0]）插入 devres 链表 */
 	spin_lock_irqsave(&dev->devres_lock, flags);
 	add_dr(dev, &grp->node[0]);
 	spin_unlock_irqrestore(&dev->devres_lock, flags);
+
 	return grp->id;
 }
 EXPORT_SYMBOL_GPL(devres_open_group);

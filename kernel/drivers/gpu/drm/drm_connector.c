@@ -799,13 +799,43 @@ static const struct drm_prop_enum_list drm_dvi_i_subconnector_enum_list[] = {
 DRM_ENUM_NAME_FN(drm_get_dvi_i_subconnector_name,
 		 drm_dvi_i_subconnector_enum_list)
 
+/**
+ * drm_tv_select_enum_list - DRM TV(Television)输出子连接器类型枚举列表
+ *
+ * 该数组定义了DRM驱动中支持的所有TV输出接口类型，将内核枚举常量
+ * 与用户态可读的字符串名称一一映射，用于：
+ * 1. 用户态通过DRM IOCTL查询TV输出接口类型；
+ * 2. 内核向用户态返回TV接口的可读名称；
+ * 3. 模式设置时指定TV输出的具体子连接器类型。
+ *
+ * 每个数组项格式：{ 内核枚举值, 用户态可读名称 }
+ */
 static const struct drm_prop_enum_list drm_tv_select_enum_list[] = {
+	/* 自动选择TV输出模式（适用于同时支持DVI-I和TV-out的接口） */
 	{ DRM_MODE_SUBCONNECTOR_Automatic, "Automatic" }, /* DVI-I and TV-out */
+	/* 复合视频接口（AV接口，最基础的模拟TV输出） */
 	{ DRM_MODE_SUBCONNECTOR_Composite, "Composite" }, /* TV-out */
+	/* S-Video接口（超级视频，分离亮度/色度信号，画质优于复合视频） */
 	{ DRM_MODE_SUBCONNECTOR_SVIDEO,    "SVIDEO"    }, /* TV-out */
+	/* 分量视频接口（YPbPr/YUV，高清TV输出常用） */
 	{ DRM_MODE_SUBCONNECTOR_Component, "Component" }, /* TV-out */
+	/* SCART接口（欧洲标准的音视频复合接口） */
 	{ DRM_MODE_SUBCONNECTOR_SCART,     "SCART"     }, /* TV-out */
 };
+
+/**
+ * DRM_ENUM_NAME_FN - DRM枚举名称映射函数生成宏
+ * @drm_get_tv_select_name: 生成的函数名，用于根据TV子连接器枚举值获取名称
+ * @drm_tv_select_enum_list: 关联的枚举列表数组
+ *
+ * 该宏是DRM内核提供的通用工具宏，会自动生成一个函数：
+ * const char *drm_get_tv_select_name(int val)
+ * 函数功能：传入TV子连接器的枚举值（如DRM_MODE_SUBCONNECTOR_SVIDEO），
+ * 返回对应的可读字符串名称（如"SVIDEO"）；若传入无效值，返回NULL。
+ *
+ * 核心用途：简化枚举值与字符串的映射逻辑，避免手动编写匹配函数，
+ * 保证DRM属性系统中枚举类型的名称查询逻辑统一。
+ */
 DRM_ENUM_NAME_FN(drm_get_tv_select_name, drm_tv_select_enum_list)
 
 static const struct drm_prop_enum_list drm_tv_subconnector_enum_list[] = {

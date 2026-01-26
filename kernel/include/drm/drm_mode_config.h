@@ -349,60 +349,68 @@ struct drm_mode_config_funcs {
  * enumerated by the driver are added here, as are global properties.  Some
  * global restrictions are also here, e.g. dimension restrictions.
  */
+/**
+ * struct drm_mode_config - DRM模式设置（modeset）核心配置结构体
+ *
+ * 该结构体是DRM驱动中模式设置子系统的核心，管理显示模式（分辨率/刷新率）、CRTC/连接器/编码器的拓扑关系、
+ * 锁机制、ID分配等关键资源，是用户态（如Xorg、Wayland）与内核态交互显示参数的核心载体。
+ */
 struct drm_mode_config {
 	/**
-	 * @mutex:
+	 * @mutex: 模式设置全局互斥锁（兼容传统BKL大锁）
 	 *
-	 * This is the big scary modeset BKL which protects everything that
-	 * isn't protect otherwise. Scope is unclear and fuzzy, try to remove
-	 * anything from under it's protection and move it into more well-scoped
-	 * locks.
+	 * 这是保护模式设置的“大而全”互斥锁，用于保护所有未被其他细粒度锁覆盖的资源，
+	 * 其保护范围原本模糊且宽泛，内核社区推荐逐步将资源迁移到更细粒度的锁下，减少对该锁的依赖。
 	 *
-	 * The one important thing this protects is the use of @acquire_ctx.
+	 * 该锁最核心的保护对象是@acquire_ctx的使用，任何访问@acquire_ctx的操作都必须持有此锁。
+	 * 注释原文：保护所有未被其他方式保护的资源，范围模糊，建议迁移到细粒度锁；核心保护@acquire_ctx的使用。
 	 */
 	struct mutex mutex;
 
 	/**
-	 * @connection_mutex:
+	 * @connection_mutex: 连接拓扑互斥锁（模式设置专用锁）
 	 *
-	 * This protects connector state and the connector to encoder to CRTC
-	 * routing chain.
+	 * 保护连接器（connector）状态，以及“连接器→编码器（encoder）→CRTC”的路由链路，
+	 * 是显示设备连接关系的核心保护锁。
 	 *
-	 * For atomic drivers specifically this protects &drm_connector.state.
+	 * 对于原子模式（atomic）驱动，该锁专门保护&drm_connector.state（连接器状态结构体），
+	 * 防止并发修改连接拓扑导致的逻辑错误。
 	 */
 	struct drm_modeset_lock connection_mutex;
 
 	/**
-	 * @acquire_ctx:
+	 * @acquire_ctx: 全局隐式模式设置获取上下文
 	 *
-	 * Global implicit acquire context used by atomic drivers for legacy
-	 * IOCTLs. Deprecated, since implicit locking contexts make it
-	 * impossible to use driver-private &struct drm_modeset_lock. Users of
-	 * this must hold @mutex.
+	 * 原子驱动为兼容传统IOCTL接口而保留的全局隐式获取上下文，已被标记为废弃（Deprecated）。
+	 * 原因是隐式锁上下文无法使用驱动私有&struct drm_modeset_lock，限制了锁机制的灵活性。
+	 *
+	 * 任何使用该上下文的操作都必须先持有@mutex锁，否则会导致竞态问题。
 	 */
 	struct drm_modeset_acquire_ctx *acquire_ctx;
 
 	/**
-	 * @idr_mutex:
+	 * @idr_mutex: KMS ID分配互斥锁
 	 *
-	 * Mutex for KMS ID allocation and management. Protects both @crtc_idr
-	 * and @tile_idr.
+	 * 用于保护KMS（Kernel Mode Setting）ID的分配与管理过程，具体保护@crtc_idr和@tile_idr两个IDR对象，
+	 * 防止并发分配/释放ID导致的重复或悬空ID问题。
 	 */
 	struct mutex idr_mutex;
 
 	/**
-	 * @crtc_idr:
+	 * @crtc_idr: KMS全局ID管理对象
 	 *
-	 * Main KMS ID tracking object. Use this idr for all IDs, fb, crtc,
-	 * connector, modes - just makes life easier to have only one.
+	 * KMS子系统的主ID跟踪器，统一管理所有类型的显示资源ID：帧缓冲（fb）、CRTC、连接器、显示模式（modes）等，
+	 * 内核设计为“单IDR管理所有资源”，简化ID分配逻辑，降低维护成本。
+	 *
+	 * IDR（Integer ID Resource）是内核用于将整数ID映射到指针的高效数据结构，替代传统数组/哈希表。
 	 */
 	struct idr crtc_idr;
 
 	/**
-	 * @tile_idr:
+	 * @tile_idr: 分块显示ID管理对象
 	 *
-	 * Use this idr for allocating new IDs for tiled sinks like use in some
-	 * high-res DP MST screens.
+	 * 专门为“分块接收器（tiled sinks）”分配新ID的IDR，典型场景是高分辨率DP MST（DisplayPort Multi-Stream Transport）屏幕，
+	 * 这类屏幕通过分块方式显示内容，需要独立的ID空间管理，因此单独拆分出该IDR。
 	 */
 	struct idr tile_idr;
 

@@ -488,6 +488,7 @@ static int component_bind(struct component *component, struct master *master,
 	dev_dbg(master->dev, "binding %s (ops %ps)\n",
 		dev_name(component->dev), component->ops);
 
+	//bind即初始化组件自身功能，为契合group框架，bind里使用devres系列函数申请资源
 	ret = component->ops->bind(component->dev, master->dev, data);
 	if (!ret) {
 		component->bound = true;
