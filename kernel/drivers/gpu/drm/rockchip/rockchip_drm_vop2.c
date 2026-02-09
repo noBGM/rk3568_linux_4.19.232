@@ -5719,6 +5719,8 @@ static void vop2_handle_vblank(struct vop2 *vop2, struct drm_crtc *crtc)
 		drm_flip_work_commit(&vp->fb_unref_work, system_unbound_wq);
 }
 
+//这个函数是用来处理VCNT事件的
+//来自1：kernel\drivers\gpu\drm\rockchip\rockchip_drm_drv.c:rockchip_drm_get_vcnt_event_ioctl
 static void vop2_handle_vcnt(struct drm_crtc *crtc)
 {
 	struct drm_device *dev = crtc->dev;

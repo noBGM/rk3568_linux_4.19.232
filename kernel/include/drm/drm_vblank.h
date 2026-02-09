@@ -86,111 +86,419 @@ struct drm_pending_vblank_event {
  * with legacy/non-kms drivers - this is a free-standing structure not directly
  * connected to &struct drm_crtc. But all public interface functions are taking
  * a &struct drm_crtc to hide this implementation detail.
+## 这段注释在说什么？
+
+### 核心问题：为什么 vblank 数据不直接放在 CRTC 结构体里？
+
+这段注释解释了一个**看起来很奇怪的设计决策**：
+
+**理想的设计应该是：**
+```c
+struct drm_crtc {
+    // CRTC 的各种成员
+    struct drm_vblank_crtc vblank;  // ← 直接包含 vblank 数据
+};
+```
+
+**但实际的设计是：**
+```c
+// drm_device.h
+struct drm_device {
+    struct drm_vblank_crtc *vblank;  // ← vblank 是单独的数组
+    // vblank[0] 对应 CRTC 0
+    // vblank[1] 对应 CRTC 1
+    // ...
+};
+
+struct drm_crtc {
+    // 里面没有 vblank 成员！
+};
+```
+
+### 为什么这样设计？历史原因
+
+让我用时间线来解释：
+
+```
+1999 年：DRM 框架诞生
+    └─> VBlank 功能被加入（用于 3D 加速）
+    └─> 那时还没有 KMS（内核模式设置）概念
+    └─> 驱动直接操作硬件，没有 drm_crtc 这个抽象
+
+2008 年：KMS 出现
+    └─> 引入了 drm_crtc、drm_encoder、drm_connector 等抽象
+    └─> 但 vblank 代码已经运行了 9 年
+    └─> 很多旧驱动（非 KMS）还在用
+
+2010+ 年：过渡期
+    └─> 新驱动用 KMS（有 drm_crtc）
+    └─> 旧驱动不用 KMS（没有 drm_crtc）
+    └─> vblank 代码需要同时支持两种驱动！
+```
+
+### "free-standing structure" 的含义
+
+**free-standing（独立的）** 意思是：
+
+```c
+// ❌ 不是这样（内嵌在 drm_crtc 里）
+struct drm_crtc {
+    struct drm_vblank_crtc vblank;  
+};
+
+// ✅ 而是这样（独立存储在 drm_device 中）
+struct drm_device {
+    struct drm_vblank_crtc *vblank;  // 独立的数组
+};
+```
+
+### "shared with legacy/non-kms drivers" 的含义
+
+**legacy/non-kms drivers（旧式/非 KMS 驱动）** 是指：
+
+| 驱动类型 | 特点 | 有没有 drm_crtc？ | 能用 vblank 吗？ |
+|----------|------|-------------------|------------------|
+| **旧式驱动** | 不用 KMS | ❌ 没有 | ✅ 能（通过数组索引） |
+| **现代驱动** | 用 KMS | ✅ 有 | ✅ 能（API 隐藏了索引） |
+
+### 如何"隐藏实现细节"？
+
+虽然内部是用数组索引，但公共 API 让你以为是直接操作 CRTC：
+
+```c
+// 用户看到的 API（使用 drm_crtc 指针，很自然）
+void drm_crtc_vblank_on(struct drm_crtc *crtc);
+void drm_crtc_vblank_off(struct drm_crtc *crtc);
+
+// 内部实现（偷偷转换成数组索引）
+void drm_crtc_vblank_on(struct drm_crtc *crtc) {
+    int pipe = drm_crtc_index(crtc);  // 获取 CRTC 的索引号
+    struct drm_vblank_crtc *vblank = &dev->vblank[pipe];  // 用索引访问数组
+    // ... 操作 vblank ...
+}
+```
+
+### 实际的数据布局
+
+```
+内存中的实际布局：
+
+drm_device
+├── vblank[0] ─────┐  对应关系（不是直接指针）
+├── vblank[1] ────┐│                ↓
+├── vblank[2] ───┐││    CRTC List:  drm_crtc[0]
+│                ││└──────────────> drm_crtc[1]
+│                │└───────────────> drm_crtc[2]
+│                └────────────────> 
+│
+└── crtc_list（链表）
+```
+
+### 类比：就像学校班级和学号
+
+想象一个奇怪的学校系统：
+
+```
+学生花名册（vblank 数组）：
+[0] 张三的成绩单
+[1] 李四的成绩单  
+[2] 王五的成绩单
+
+班级名单（crtc 链表）：
+- 学生对象：张三（学号 0）
+- 学生对象：李四（学号 1）
+- 学生对象：王五（学号 2）
+
+为什么不把成绩单直接放在学生对象里？
+→ 因为旧系统（遗留代码）只知道学号，不知道学生对象
+→ 新系统用学生对象，但查成绩时偷偷转成学号去查数组
+```
+
+## 总结
+
+这段注释的意思是：
+
+1. **设计缺陷**：`drm_vblank_crtc` 应该在 `drm_crtc` 里面，但没有
+2. **历史包袱**：因为 vblank 代码比 KMS 早，需要兼容旧驱动
+3. **权宜之计**：用独立数组 + 索引映射来解决
+4. **表面和谐**：公共 API 隐藏了这个丑陋的实现
+
+**一句话总结：这是技术债，为了兼容性不得不妥协的设计。**
+ */
+/**
+ * struct drm_vblank_crtc - 单个 CRTC 的 VBlank 跟踪管理结构
+ *
+ * 每个 CRTC（显示控制器）都有一个独立的 VBlank 跟踪结构实例。
+ * 这个结构体负责：
+ * 1. 管理 VBlank 中断的使能/禁用
+ * 2. 维护 VBlank 计数器和时间戳
+ * 3. 处理等待 VBlank 事件的进程队列
+ * 4. 实现延迟禁用机制以优化性能
  */
 struct drm_vblank_crtc {
 	/**
-	 * @dev: Pointer to the &drm_device.
+	 * @dev: 所属的 DRM 设备
+	 *
+	 * 指向拥有此 VBlank 跟踪结构的 DRM 设备。
+	 * 用于访问设备级别的配置和锁。
 	 */
 	struct drm_device *dev;
+
 	/**
-	 * @queue: Wait queue for vblank waiters.
+	 * @queue: VBlank 等待队列
+	 *
+	 * 用于让进程休眠等待下一个 VBlank 事件的等待队列。
+	 * 
+	 * 使用场景：
+	 * - 用户空间调用 DRM_IOCTL_WAIT_VBLANK 时会在此队列休眠
+	 * - VBlank 中断到来时唤醒队列中的所有等待者
+	 * - 适用于同步渲染、垂直同步等场景
 	 */
-	wait_queue_head_t queue;	/**< VBLANK wait queue */
+	wait_queue_head_t queue;
+
 	/**
-	 * @disable_timer: Disable timer for the delayed vblank disabling
-	 * hysteresis logic. Vblank disabling is controlled through the
-	 * drm_vblank_offdelay module option and the setting of the
-	 * &drm_device.max_vblank_count value.
+	 * @disable_timer: VBlank 延迟禁用定时器
+	 *
+	 * 实现"延迟禁用"机制的核心定时器。当 VBlank 引用计数降为 0 时，
+	 * 不会立即禁用硬件中断，而是启动此定时器。定时器到期后才真正
+	 * 禁用中断。
+	 *
+	 * 延迟时间由以下因素控制：
+	 * - drm_vblank_offdelay 模块参数（默认 5000ms）
+	 * - &drm_device.max_vblank_count 的设置
+	 *
+	 * 设计目的：
+	 * - 避免频繁开关中断的性能开销
+	 * - 规避某些硬件无法安全立即禁用中断的问题
+	 * - 减少 AXI 总线事务和 CPU 流水线停顿
 	 */
 	struct timer_list disable_timer;
 
 	/**
-	 * @seqlock: Protect vblank count and time.
+	 * @seqlock: VBlank 计数和时间戳保护锁
+	 *
+	 * 使用 seqlock（顺序锁）而非普通自旋锁，因为：
+	 * 1. 读多写少：大量读取操作（获取当前 VBlank 计数）
+	 * 2. 写操作很快：只在 VBlank 中断时更新（极短时间）
+	 * 3. 读者无需加锁：通过序列号检测是否需要重试
+	 *
+	 * 保护的数据：@count 和 @time
 	 */
-	seqlock_t seqlock;		/* protects vblank count and time */
+	seqlock_t seqlock;
 
 	/**
-	 * @count: Current software vblank counter.
+	 * @count: 软件维护的 VBlank 计数器
+	 *
+	 * 64 位软件计数器，记录从系统启动以来发生的 VBlank 总数。
+	 * 即使硬件计数器溢出回绕，这个软件计数器也会持续递增。
+	 *
+	 * 更新时机：
+	 * - 每次 VBlank 中断时 +1
+	 * - 驱动可能根据硬件计数器推算漏掉的 VBlank
+	 *
+	 * 用途：
+	 * - 用户空间同步渲染
+	 * - 计算帧率
+	 * - 检测丢帧
 	 */
 	u64 count;
+
 	/**
-	 * @time: Vblank timestamp corresponding to @count.
+	 * @time: VBlank 时间戳
+	 *
+	 * 记录 @count 对应的 VBlank 发生的精确时间（纳秒精度）。
+	 * 使用高精度时钟（ktime_t），通常基于系统单调时钟。
+	 *
+	 * 用途：
+	 * - 精确的帧时序控制
+	 * - 视频播放同步
+	 * - 性能分析和帧率统计
 	 */
 	ktime_t time;
 
 	/**
-	 * @refcount: Number of users/waiters of the vblank interrupt. Only when
-	 * this refcount reaches 0 can the hardware interrupt be disabled using
-	 * @disable_timer.
+	 * @refcount: VBlank 中断引用计数
+	 *
+	 * 原子计数器，记录当前有多少个用户需要 VBlank 中断保持开启。
+	 *
+	 * 工作机制：
+	 * - drm_crtc_vblank_get() 调用时 +1
+	 * - drm_crtc_vblank_put() 调用时 -1
+	 * - 只有当计数降为 0 时，才允许通过 @disable_timer 禁用中断
+	 *
+	 * 使用场景示例：
+	 * - 用户空间等待 VBlank 时持有引用
+	 * - 驱动执行页面翻转期间持有引用
+	 * - 多个用户可以同时持有引用（计数累加）
+	 *
+	 * 原子类型原因：可能在中断上下文中修改，需要无锁原子操作
 	 */
-	atomic_t refcount;		/* number of users of vblank interruptsper crtc */
+	atomic_t refcount;
+
 	/**
-	 * @last: Protected by &drm_device.vbl_lock, used for wraparound handling.
+	 * @last: 上次读取的硬件 VBlank 计数器值
+	 *
+	 * 缓存上一次从硬件读取的计数器值，用于检测硬件计数器回绕。
+	 *
+	 * 回绕检测逻辑：
+	 *   if (硬件当前值 < last)
+	 *       检测到回绕，软件计数器需要补偿
+	 *
+	 * 访问保护：由 &drm_device.vbl_lock 保护
+	 *
+	 * 示例：24 位计数器
+	 *   last = 0xFFFFFE
+	 *   硬件值 = 0x000001  ← 检测到回绕！
+	 *   软件计数器需要加上 (0xFFFFFF - 0xFFFFFE + 0x000001)
 	 */
 	u32 last;
+
 	/**
-	 * @max_vblank_count:
+	 * @max_vblank_count: 硬件 VBlank 计数器的最大值
 	 *
-	 * Maximum value of the vblank registers for this crtc. This value +1
-	 * will result in a wrap-around of the vblank register. It is used
-	 * by the vblank core to handle wrap-arounds.
+	 * 硬件计数器寄存器的最大值。当计数器达到此值后会溢出归零。
+	 * VBlank 核心使用此值来正确处理计数器回绕。
 	 *
-	 * If set to zero the vblank core will try to guess the elapsed vblanks
-	 * between times when the vblank interrupt is disabled through
-	 * high-precision timestamps. That approach is suffering from small
-	 * races and imprecision over longer time periods, hence exposing a
-	 * hardware vblank counter is always recommended.
+	 * 配置方式：
+	 * 1. 使用硬件计数器（推荐）：
+	 *    设置为硬件寄存器的最大值，例如：
+	 *    - 24 位计数器：max_vblank_count = 0xFFFFFF
+	 *    - 32 位计数器：max_vblank_count = 0xFFFFFFFF
+	 *    此时必须实现 &drm_crtc_funcs.get_vblank_counter
 	 *
-	 * This is the runtime configurable per-crtc maximum set through
-	 * drm_crtc_set_max_vblank_count(). If this is used the driver
-	 * must leave the device wide &drm_device.max_vblank_count at zero.
+	 * 2. 不使用硬件计数器（不推荐）：
+	 *    设置为 0，VBlank 核心会通过高精度时间戳推算经过的 VBlank 数。
+	 *    缺点：存在竞态条件和长期误差累积问题。
 	 *
-	 * If non-zero, &drm_crtc_funcs.get_vblank_counter must be set.
+	 * 与设备级配置的关系：
+	 * - 这是每个 CRTC 独立配置的值（运行时可调）
+	 * - 如果使用此字段，必须将 &drm_device.max_vblank_count 设为 0
+	 * - 通过 drm_crtc_set_max_vblank_count() 设置
 	 */
 	u32 max_vblank_count;
+
 	/**
-	 * @inmodeset: Tracks whether the vblank is disabled due to a modeset.
-	 * For legacy driver bit 2 additionally tracks whether an additional
-	 * temporary vblank reference has been acquired to paper over the
-	 * hardware counter resetting/jumping. KMS drivers should instead just
-	 * call drm_crtc_vblank_off() and drm_crtc_vblank_on(), which explicitly
-	 * save and restore the vblank count.
+	 * @inmodeset: 模式设置期间的 VBlank 状态标志
+	 *
+	 * 跟踪 VBlank 是否因为正在进行模式设置（modeset）而被禁用。
+	 *
+	 * 标志位含义：
+	 * - bit 0: VBlank 是否因 modeset 而禁用
+	 * - bit 1: （旧式驱动专用）是否获取了临时 VBlank 引用
+	 *
+	 * 使用场景：
+	 * 
+	 * 现代 KMS 驱动（推荐）：
+	 *   drm_crtc_vblank_off();   // modeset 开始，保存 VBlank 计数
+	 *   // ... 执行模式切换 ...
+	 *   drm_crtc_vblank_on();    // modeset 完成，恢复 VBlank 计数
+	 *
+	 * 旧式驱动（遗留兼容）：
+	 *   需要额外处理硬件计数器重置/跳变的情况，bit 1 用于标记
+	 *   是否持有了临时引用来"掩盖"这个问题。
+	 *
+	 * 设计目的：
+	 * - 避免 modeset 期间的 VBlank 计数错误
+	 * - 确保用户空间不会在模式切换时收到错误的 VBlank 事件
 	 */
-	unsigned int inmodeset;		/* Display driver is setting mode */
+	unsigned int inmodeset;
+
 	/**
-	 * @pipe: drm_crtc_index() of the &drm_crtc corresponding to this
-	 * structure.
+	 * @pipe: CRTC 索引号
+	 *
+	 * 对应 CRTC 在系统中的索引号，等同于 drm_crtc_index(&drm_crtc)。
+	 *
+	 * 用途：
+	 * - 反向查找：从 drm_vblank_crtc 找到对应的 drm_crtc
+	 * - 日志输出和调试
+	 * - 用户空间接口（很多 ioctl 使用 pipe 编号）
+	 *
+	 * 历史术语：
+	 * "pipe" 来自 Intel 显卡术语，实际上就是 CRTC 编号。
+	 * pipe 0 = CRTC 0, pipe 1 = CRTC 1, 依此类推。
 	 */
 	unsigned int pipe;
+
 	/**
-	 * @framedur_ns: Frame/Field duration in ns, used by
-	 * drm_calc_vbltimestamp_from_scanoutpos() and computed by
-	 * drm_calc_timestamping_constants().
+	 * @framedur_ns: 单帧持续时间（纳秒）
+	 *
+	 * 一帧画面的完整持续时间，包括垂直消隐期。
+	 *
+	 * 计算方式：
+	 *   framedur_ns = (vtotal * htotal * 1000000000) / pixelclock
+	 *   例如 1920x1080@60Hz：
+	 *   framedur_ns ≈ 16,666,667 ns (1/60 秒)
+	 *
+	 * 由 drm_calc_timestamping_constants() 计算并缓存。
+	 *
+	 * 用途：
+	 * - drm_calc_vbltimestamp_from_scanoutpos() 计算精确时间戳
+	 * - 从扫描位置反推 VBlank 发生的精确时刻
+	 * - 帧率控制和同步
 	 */
 	int framedur_ns;
+
 	/**
-	 * @linedur_ns: Line duration in ns, used by
-	 * drm_calc_vbltimestamp_from_scanoutpos() and computed by
-	 * drm_calc_timestamping_constants().
+	 * @linedur_ns: 单行扫描持续时间（纳秒）
+	 *
+	 * 显示器扫描一行像素所需的时间。
+	 *
+	 * 计算方式：
+	 *   linedur_ns = (htotal * 1000000000) / pixelclock
+	 *   例如 1920x1080@60Hz：
+	 *   linedur_ns ≈ 11,111 ns
+	 *
+	 * 由 drm_calc_timestamping_constants() 计算并缓存。
+	 *
+	 * 用途：
+	 * - 从当前扫描行位置精确计算时间偏移
+	 * - 配合 @framedur_ns 实现高精度时间戳计算
+	 * - 支持基于扫描位置的 VBlank 时间戳推算
 	 */
 	int linedur_ns;
 
 	/**
-	 * @hwmode:
+	 * @hwmode: 硬件显示模式缓存
 	 *
-	 * Cache of the current hardware display mode. Only valid when @enabled
-	 * is set. This is used by helpers like
-	 * drm_calc_vbltimestamp_from_scanoutpos(). We can't just access the
-	 * hardware mode by e.g. looking at &drm_crtc_state.adjusted_mode,
-	 * because that one is really hard to get from interrupt context.
+	 * 缓存当前硬件使用的显示模式（分辨率、刷新率等）。
+	 *
+	 * 为什么需要缓存？
+	 * 1. 中断上下文限制：
+	 *    VBlank 中断处理函数运行在中断上下文，无法访问复杂的内核结构。
+	 *    直接访问 &drm_crtc_state.adjusted_mode 需要锁，在中断中很危险。
+	 *
+	 * 2. 性能考虑：
+	 *    每次 VBlank 中断都需要查询模式信息，缓存避免了复杂查找。
+	 *
+	 * 有效性：
+	 *    只在 @enabled 为 true 时有效。
+	 *
+	 * 更新时机：
+	 *    drm_crtc_vblank_on() 调用时从当前 CRTC 状态拷贝。
+	 *
+	 * 使用者：
+	 *    drm_calc_vbltimestamp_from_scanoutpos() 等辅助函数。
 	 */
 	struct drm_display_mode hwmode;
 
 	/**
-	 * @enabled: Tracks the enabling state of the corresponding &drm_crtc to
-	 * avoid double-disabling and hence corrupting saved state. Needed by
-	 * drivers not using atomic KMS, since those might go through their CRTC
-	 * disabling functions multiple times.
+	 * @enabled: VBlank 跟踪使能状态
+	 *
+	 * 跟踪此 CRTC 的 VBlank 跟踪是否已启用，防止重复禁用导致状态损坏。
+	 *
+	 * 状态转换：
+	 *   drm_crtc_vblank_on()  → enabled = true
+	 *   drm_crtc_vblank_off() → enabled = false
+	 *
+	 * 为什么需要？
+	 * 非原子 KMS 驱动可能多次调用 CRTC 禁用函数，导致：
+	 * - 保存的 VBlank 计数被错误覆盖
+	 * - 状态不一致
+	 * - 引用计数混乱
+	 *
+	 * 使用此标志可以检测并忽略重复的 off/on 调用。
+	 *
+	 * 现代原子 KMS 驱动不需要此保护，但为了兼容保留。
 	 */
 	bool enabled;
 };

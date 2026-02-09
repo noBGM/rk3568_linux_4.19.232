@@ -134,45 +134,49 @@ struct drm_device {
 	int irq;
 
 	/**
-	 * @vblank_disable_immediate:
+	 * @vblank_disable_immediate: VBlank 中断立即禁用标志
 	 *
-	 * If true, vblank interrupt will be disabled immediately when the
-	 * refcount drops to zero, as opposed to via the vblank disable
-	 * timer.
+	 * 当引用计数降为 0 时，是否立即禁用 vblank 中断。
+	 * - true: 引用计数为 0 时立即禁用中断
+	 * - false: 通过禁用定时器延迟禁用（节省开关中断的开销）
 	 *
-	 * This can be set to true it the hardware has a working vblank counter
-	 * with high-precision timestamping (otherwise there are races) and the
-	 * driver uses drm_crtc_vblank_on() and drm_crtc_vblank_off()
-	 * appropriately. See also @max_vblank_count and
-	 * &drm_crtc_funcs.get_vblank_counter.
+	 * 满足以下条件时可设为 true：
+	 * 1. 硬件有可用的 vblank 计数器且支持高精度时间戳
+	 * 2. 驱动正确使用 drm_crtc_vblank_on() 和 drm_crtc_vblank_off()
+	 *
+	 * 参考: @max_vblank_count 和 &drm_crtc_funcs.get_vblank_counter
 	 */
 	bool vblank_disable_immediate;
 
 	/**
-	 * @vblank:
+	 * @vblank: VBlank 跟踪结构体数组
 	 *
-	 * Array of vblank tracking structures, one per &struct drm_crtc. For
-	 * historical reasons (vblank support predates kernel modesetting) this
-	 * is free-standing and not part of &struct drm_crtc itself. It must be
-	 * initialized explicitly by calling drm_vblank_init().
+	 * 每个 CRTC 对应一个 vblank 跟踪结构体。由于历史原因（vblank 支持
+	 * 早于内核模式设置），这是独立的数组而不是 &struct drm_crtc 的一部分。
+	 * 必须通过 drm_vblank_init() 显式初始化。
+	 *
+	 * VBlank（垂直消隐）：显示器刷新帧之间的间隔时间，用于同步显示更新
 	 */
 	struct drm_vblank_crtc *vblank;
 
-	spinlock_t vblank_time_lock;    /**< Protects vblank count and time updates during vblank enable/disable */
-	spinlock_t vbl_lock;
+	/**
+	 * vblank_time_lock: VBlank 时间保护锁
+	 * 保护 vblank 计数和时间更新操作，防止使能/禁用期间的并发访问
+	 */
+	spinlock_t vblank_time_lock;
+	spinlock_t vbl_lock;  /* VBlank 通用保护锁 */
 
 	/**
-	 * @max_vblank_count:
+	 * @max_vblank_count: VBlank 计数器寄存器最大值
 	 *
-	 * Maximum value of the vblank registers. This value +1 will result in a
-	 * wrap-around of the vblank register. It is used by the vblank core to
-	 * handle wrap-arounds.
+	 * 硬件 vblank 寄存器的最大值。该值 +1 会导致寄存器回绕（溢出归零），
+	 * vblank 核心使用此值处理回绕情况。
 	 *
-	 * If set to zero the vblank core will try to guess the elapsed vblanks
-	 * between times when the vblank interrupt is disabled through
-	 * high-precision timestamps. That approach is suffering from small
-	 * races and imprecision over longer time periods, hence exposing a
-	 * hardware vblank counter is always recommended.
+	 * 取值说明：
+	 * - 0: vblank 核心通过高精度时间戳推算经过的 vblank 数（存在竞态和误差，
+	 *      长时间运行精度会下降，不推荐）
+	 * - 非 0: 使用硬件 vblank 计数器（推荐），此时必须设置
+	 *         &drm_crtc_funcs.get_vblank_counter
 	 *
 	 * This is the statically configured device wide maximum. The driver
 	 * can instead choose to use a runtime configurable per-crtc value
@@ -185,7 +189,8 @@ struct drm_device {
 	u32 max_vblank_count;           /**< size of vblank counter register */
 
 	/**
-	 * List of events
+	 * vblank_event_list: VBlank 事件链表
+	 * 存储所有待处理的 vblank 事件（如页面翻转完成通知等）
 	 */
 	struct list_head vblank_event_list;
 	spinlock_t event_lock;

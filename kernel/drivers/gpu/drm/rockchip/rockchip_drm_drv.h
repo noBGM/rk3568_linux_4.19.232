@@ -26,6 +26,8 @@
 #include <linux/module.h>
 #include <linux/component.h>
 
+
+//数字解释见笔记1_rockchip-drm-drv.c_笔记.md:ROCKCHIP_MAX_解释
 #define ROCKCHIP_MAX_FB_BUFFER	3
 #define ROCKCHIP_MAX_CONNECTOR	2
 #define ROCKCHIP_MAX_CRTC	4

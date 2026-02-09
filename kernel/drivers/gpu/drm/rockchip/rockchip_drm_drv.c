@@ -1514,23 +1514,65 @@ static void rockchip_gem_pool_destroy(struct drm_device *drm)
 	gen_pool_destroy(private->secure_buffer_pool);
 }
 
+/**
+ * rockchip_attach_connector_property - 为所有 connector 附加 TV 显示属性
+ * @drm: DRM 设备对象
+ *
+ * 遍历系统中的所有显示输出接口（connector），为每个接口附加 TV 相关的
+ * 显示属性（亮度、对比度、饱和度、色调），并设置默认值为 50。
+ *
+ * 为什么存在多个 connector？
+ * 一个 SoC 通常有多个物理显示输出端口，每个端口对应一个 connector：
+ * - HDMI 接口（通过 inno_hdmi.c 或 cdn-dp-core.c 创建）
+ * - MIPI DSI 接口（通过 dw-mipi-dsi.c 创建，用于连接 LCD 屏幕）
+ * - eDP 接口（嵌入式 DisplayPort）
+ * - LVDS 接口（用于传统 LCD）
+ *
+ * 例如 RK3568 芯片可能同时支持：
+ * - 1 个 HDMI 输出（连接电视/显示器）
+ * - 2 个 MIPI DSI 输出（连接手机屏或平板屏）
+ * 这样就会有 3 个 connector 对象
+ *
+ * 每个 connector 可以独立配置显示参数，支持多屏异显或同显。
+ * RK3568 示例架构：
+┌──────────────────────────────────────┐
+│         RK3568 SoC                   │
+│                                      │
+│  ┌────────┐   ┌──────────────┐      │
+│  │  VOP2  │──→│ HDMI TX      │─────→│ HDMI Connector (connector 0)
+│  │(显示控制)│   └──────────────┘      │
+│  │        │   ┌──────────────┐      │
+│  │        │──→│ MIPI DSI0    │─────→│ MIPI DSI Connector (connector 1)
+│  │        │   └──────────────┘      │
+│  │        │   ┌──────────────┐      │
+│  │        │──→│ MIPI DSI1    │─────→│ MIPI DSI Connector (connector 2)
+│  └────────┘   └──────────────┘      │
+│                ┌──────────────┐      │
+│               │ eDP          │─────→│ eDP Connector (connector 3)
+│                └──────────────┘      │
+└──────────────────────────────────────┘
+ */
 static void rockchip_attach_connector_property(struct drm_device *drm)
 {
 	struct drm_connector *connector;
 	struct drm_mode_config *conf = &drm->mode_config;
 	struct drm_connector_list_iter conn_iter;
 
+	/* 加锁保护 mode_config 配置操作 */
 	mutex_lock(&drm->mode_config.mutex);
 
+	/* 定义属性附加宏，简化重复代码 */
 #define ROCKCHIP_PROP_ATTACH(prop, v) \
 		drm_object_attach_property(&connector->base, prop, v)
 
+	/* 初始化 connector 迭代器并遍历所有 connector */
 	drm_connector_list_iter_begin(drm, &conn_iter);
 	drm_for_each_connector_iter(connector, &conn_iter) {
-		ROCKCHIP_PROP_ATTACH(conf->tv_brightness_property, 50);
-		ROCKCHIP_PROP_ATTACH(conf->tv_contrast_property, 50);
-		ROCKCHIP_PROP_ATTACH(conf->tv_saturation_property, 50);
-		ROCKCHIP_PROP_ATTACH(conf->tv_hue_property, 50);
+		/* 为当前 connector 附加 4 个 TV 属性，默认值均为 50 */
+		ROCKCHIP_PROP_ATTACH(conf->tv_brightness_property, 50);  /* 亮度 */
+		ROCKCHIP_PROP_ATTACH(conf->tv_contrast_property, 50);    /* 对比度 */
+		ROCKCHIP_PROP_ATTACH(conf->tv_saturation_property, 50);  /* 饱和度 */
+		ROCKCHIP_PROP_ATTACH(conf->tv_hue_property, 50);         /* 色调 */
 	}
 	drm_connector_list_iter_end(&conn_iter);
 #undef ROCKCHIP_PROP_ATTACH
@@ -1685,6 +1727,7 @@ static int rockchip_drm_bind(struct device *dev)
 		goto err_mode_config_cleanup;
 
 	rockchip_attach_connector_property(drm_dev);
+	// 初始化 VBlank 机制，用于管理各个 CRTC 的垂直消隐（VBlank）中断与帧计数
 	ret = drm_vblank_init(drm_dev, drm_dev->mode_config.num_crtc);
 	if (ret)
 		goto err_unbind_all;
@@ -1769,12 +1812,37 @@ static void rockchip_drm_unbind(struct device *dev)
 	drm_dev_put(drm_dev);
 }
 
+/**
+ * rockchip_drm_crtc_cancel_pending_vblank - 取消某进程在指定 CRTC 上的待处理 VBlank 事件
+ * @crtc: 目标 CRTC
+ * @file_priv: 要清理的进程的 DRM 文件句柄
+ *
+ * 当用户空间进程关闭 DRM 文件描述符时调用（在 rockchip_drm_postclose 中）。
+ *
+ * 典型场景：
+ *   1. 用户空间进程请求了 VBlank 事件（如等待 page flip 完成）
+ *   2. 但在事件到来之前，进程崩溃或主动关闭了 /dev/dri/card0
+ *   3. 内核需要清理这些"孤儿事件"，避免内存泄漏和野指针
+ *
+ * 本函数委托给具体的 CRTC 实现（如 VOP2）来执行清理，
+ * 因为不同硬件的事件管理机制可能不同。
+ */
 static void rockchip_drm_crtc_cancel_pending_vblank(struct drm_crtc *crtc,
 						    struct drm_file *file_priv)
 {
 	struct rockchip_drm_private *priv = crtc->dev->dev_private;
 	int pipe = drm_crtc_index(crtc);
 
+	/*
+	 * 三重安全检查：
+	 * 1. pipe < ROCKCHIP_MAX_CRTC: 防止数组越界
+	 * 2. priv->crtc_funcs[pipe]: 确保该 CRTC 已注册
+	 * 3. cancel_pending_vblank: 确保该 CRTC 实现了取消回调
+	 *
+	 * 为什么需要这些检查？
+	 * - 某些 CRTC 可能尚未初始化（系统启动早期）
+	 * - 旧硬件可能不支持这个回调（向后兼容）
+	 */
 	if (pipe < ROCKCHIP_MAX_CRTC &&
 	    priv->crtc_funcs[pipe] &&
 	    priv->crtc_funcs[pipe]->cancel_pending_vblank)
@@ -1791,11 +1859,28 @@ static int rockchip_drm_open(struct drm_device *dev, struct drm_file *file)
 	return 0;
 }
 
+/**
+ * rockchip_drm_postclose - 进程关闭 DRM 文件描述符后的清理回调
+ * @dev: DRM 设备
+ * @file_priv: 正在关闭的文件句柄
+ *
+ * 当用户空间进程执行 close(/dev/dri/card0) 时，DRM 核心会调用此回调。
+ *
+ * 职责：清理该进程留下的所有"未完成的事务"，避免资源泄漏。
+ *
+ * 具体操作：
+ *   遍历所有 CRTC，取消该进程在每个 CRTC 上的待处理 VBlank 事件。
+ *
+ * 为什么要遍历所有 CRTC？
+ *   一个进程可能同时在多个显示器（多个 CRTC）上请求了 VBlank 事件，
+ *   关闭文件时需要全部清理。
+ */
 static void rockchip_drm_postclose(struct drm_device *dev,
 				   struct drm_file *file_priv)
 {
 	struct drm_crtc *crtc;
 
+	/* 遍历所有 CRTC，清理该进程的待处理事件 */
 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head)
 		rockchip_drm_crtc_cancel_pending_vblank(crtc, file_priv);
 }
@@ -1808,6 +1893,23 @@ static void rockchip_drm_lastclose(struct drm_device *dev)
 		drm_fb_helper_restore_fbdev_mode_unlocked(priv->fbdev_helper);
 }
 
+/**
+ * rockchip_drm_add_vcnt_event - 创建一个 vcnt（垂直计数）事件
+ *
+ * Rockchip 自定义的扩展机制：vcnt 事件。
+ * 与标准 DRM VBlank 事件不同，vcnt 由 VOP2 硬件的行计数器驱动
+ * （见 vop2_read_vcnt()），可以精确获取当前扫描到第几行。
+ *
+ * 本函数负责：
+ * 1. 分配一个 pending event 结构
+ * 2. 填充事件类型为 DRM_EVENT_ROCKCHIP_CRTC_VCNT（Rockchip 私有事件类型）
+ * 3. 将用户空间传入的 signal（用户自定义标识）保存到 user_data
+ * 4. 注册到 DRM 事件系统，等待 vop2_handle_vcnt() 在中断中发送给用户空间
+ *
+ * @crtc: 目标 CRTC
+ * @vblwait: 用户空间传入的 vblank 请求参数（复用标准 VBlank 的数据格式）
+ * @file_priv: 发起请求的用户空间进程的 DRM 文件句柄
+ */
 static struct drm_pending_vblank_event *
 rockchip_drm_add_vcnt_event(struct drm_crtc *crtc, union drm_wait_vblank *vblwait,
 			    struct drm_file *file_priv)
@@ -1820,12 +1922,14 @@ rockchip_drm_add_vcnt_event(struct drm_crtc *crtc, union drm_wait_vblank *vblwai
 	if (!e)
 		return NULL;
 
+	/* 填充事件基本信息 */
 	e->pipe = drm_crtc_index(crtc);
-	e->event.base.type = DRM_EVENT_ROCKCHIP_CRTC_VCNT;
+	e->event.base.type = DRM_EVENT_ROCKCHIP_CRTC_VCNT; /* Rockchip 私有事件类型 0xf */
 	e->event.base.length = sizeof(e->event.vbl);
 	e->event.vbl.crtc_id = crtc->base.id;
-	e->event.vbl.user_data = vblwait->request.signal;
+	e->event.vbl.user_data = vblwait->request.signal; /* 用户自定义标识，原样回传 */
 
+	/* 注册到 DRM 事件队列，后续可通过 read(/dev/dri/card0) 读取 */
 	spin_lock_irqsave(&dev->event_lock, flags);
 	drm_event_reserve_init_locked(dev, file_priv, &e->base, &e->event.base);
 	spin_unlock_irqrestore(&dev->event_lock, flags);
@@ -1833,24 +1937,121 @@ rockchip_drm_add_vcnt_event(struct drm_crtc *crtc, union drm_wait_vblank *vblwai
 	return e;
 }
 
+/**
+ * rockchip_drm_get_vcnt_event_ioctl - Rockchip 私有 ioctl：注册 vcnt 事件
+ *
+ * 用户空间通过 DRM_IOCTL_ROCKCHIP_GET_VCNT_EVENT 调用此函数。
+ *
+ * 工作流程：
+ * 1. 用户空间发起 ioctl，携带目标 CRTC 编号和 _DRM_ROCKCHIP_VCNT_EVENT 标志
+ * 2. 本函数从请求中解析出 pipe（CRTC 索引）和 flags
+ * 3. 创建 pending event 并挂到 priv->vcnt[pipe].event
+ * 4. 当下一次 VOP2 中断到来时，vop2_handle_vcnt() 会：
+ *    - 填充时间戳和序列号
+ *    - 通过 drm_send_event() 发送给用户空间
+ *    - 用户空间通过 read() 或 poll() 接收事件
+ *
+ * pipe 编号解析逻辑（兼容标准 VBlank 的编码方式）：
+ * - 高位编码（_DRM_VBLANK_HIGH_CRTC_MASK）：支持多 CRTC（>2 个）
+ * - 低位编码（_DRM_VBLANK_SECONDARY）：简单的 0/1 选择（旧式，仅两个 CRTC）
+ *
+ * rockchip_drm_get_vcnt_event_ioctl - 处理用户空间请求注册 vcnt 事件的 ioctl 接口
+ *
+ * @dev:       DRM 核心的 drm_device 设备指针
+ * @data:      用户空间传入的参数（类型为 union drm_wait_vblank *，包含请求信息）
+ * @file_priv: 当前发起请求的 drm_file 句柄，代表调用进程
+ */
 static int rockchip_drm_get_vcnt_event_ioctl(struct drm_device *dev, void *data,
 					     struct drm_file *file_priv)
 {
 	struct rockchip_drm_private *priv = dev->dev_private;
+
+	/*
+	 * data 是用户空间传入的 ioctl 参数。
+	 * 复用了标准 VBlank 的数据结构 union drm_wait_vblank，里面有：
+	 *   .request.type:   标志位 + CRTC 编号（打包在一个 u32 里）
+	 *   .request.signal: 用户自定义数据（会原样回传给用户空间）
+	 */
+
+	/*
+	 * drm_wait_vblank 是 DRM 子系统用于等待垂直同步（VBlank）和事件通知的标准用户空间请求结构。
+	 * 它通常作为ioctl参数传递，包括：
+	 *   union drm_wait_vblank {
+	 *       struct drm_wait_vblank_request {
+	 *           __u32 type;     // 类型和相关标志位。编码了CRTC编号、事件类型、行为等信息。
+	 *           __u32 sequence; // 用于绝对或相对的帧序列号等待
+	 *           __u32 signal;   // 用户自定义数据，事件到达时原样返回，便于用户做关联
+	 *       } request;
+	 *       struct drm_wait_vblank_reply {
+	 *           __u32 type;         // 返回的类型与请求时一致
+	 *           __u32 sequence;     // 当前/实际生效的帧序列号
+	 *           __s64 tval_sec;     // 时间戳（秒）
+	 *           __s64 tval_usec;    // 时间戳（微秒）
+	 *       } reply;
+	 *   };
+	 * 在本驱动的 VCNT 扩展ioctl/事件里，利用了其中的 request.type（编码flags和CRTC），
+	 * request.signal（用户上下文），由内核在事件完成时填充 reply 结构返回给用户。
+	 */
 	union drm_wait_vblank *vblwait = data;
+	/* 指向等待发送到用户空间的 VBlank 事件（用于通知应用新的垂直同步/VSync 到来，例如页面翻转完成）。 */
 	struct drm_pending_vblank_event *e;
 	struct drm_crtc *crtc;
 	unsigned int flags, pipe;
 
+	/*
+	 * 从 type 字段提取标志位。
+	 *
+	 * type 字段的位布局（定义在 uapi/drm/drm.h）：
+	 *
+	 *   bit 31: _DRM_ROCKCHIP_VCNT_EVENT (0x80000000) ← Rockchip 私有
+	 *   bit 30: _DRM_VBLANK_SIGNAL       (0x40000000) ← 已废弃
+	 *   bit 29: _DRM_VBLANK_SECONDARY    (0x20000000) ← 旧式 CRTC 选择
+	 *   bit 28: _DRM_VBLANK_NEXTONMISS   (0x10000000) ← 错过则等下一个
+	 *   bit 26: _DRM_VBLANK_EVENT        (0x04000000) ← 发送事件而非阻塞
+	 *   bit 1-5: HIGH_CRTC_MASK          (0x0000003e) ← 新式 CRTC 编号
+	 *   bit 0:   类型（ABSOLUTE/RELATIVE）
+	 *
+	 * 这里只关心标志位部分 + Rockchip 私有的 vcnt 标志。
+	 */
 	flags = vblwait->request.type & (_DRM_VBLANK_FLAGS_MASK | _DRM_ROCKCHIP_VCNT_EVENT);
+
+	/*
+	 * 从 type 字段解析 CRTC 编号（pipe）。
+	 *
+	 * 历史演进：
+	 *
+	 * 旧方案（只支持 2 个 CRTC）：
+	 *   bit 29 (_DRM_VBLANK_SECONDARY)：
+	 *     0 → pipe 0（主显示器）
+	 *     1 → pipe 1（副显示器）
+	 *
+	 * 新方案（支持最多 16 个 CRTC）：
+	 *   bit 1-5 (_DRM_VBLANK_HIGH_CRTC_MASK)：
+	 *     存储 CRTC 编号（右移 1 位后得到实际索引）
+	 *     例如：bit[1:5] = 0b00010 → 右移 1 位 → pipe = 1
+	 *           bit[1:5] = 0b00100 → 右移 1 位 → pipe = 2
+	 *
+	 * 优先使用新方案（非零说明用户使用了新编码）；
+	 * 如果新方案字段为 0，回退到旧方案。
+	 */
 	pipe = (vblwait->request.type & _DRM_VBLANK_HIGH_CRTC_MASK);
 	if (pipe)
-		pipe = pipe >> _DRM_VBLANK_HIGH_CRTC_SHIFT;
+		pipe = pipe >> _DRM_VBLANK_HIGH_CRTC_SHIFT; /* 新方案：右移得到索引 */
 	else
-		pipe = flags & _DRM_VBLANK_SECONDARY ? 1 : 0;
+		pipe = flags & _DRM_VBLANK_SECONDARY ? 1 : 0; /* 旧方案：0 或 1 */
 
+	/* 通过 pipe 索引找到对应的 drm_crtc 结构体 */
 	crtc = drm_crtc_from_index(dev, pipe);
 
+	/*
+	 * 如果用户设置了 Rockchip 私有的 vcnt 事件标志，
+	 * 创建一个 pending event 并挂到对应 pipe 的 vcnt 槽位上。
+	 *
+	 * 只有一个槽位（priv->vcnt[pipe].event），所以：
+	 * - 每个 CRTC 同时只能有一个 vcnt 事件在等待
+	 * - 新的请求会覆盖旧的（如果旧的还没被处理）
+	 * - vop2_handle_vcnt() 在中断中会消费掉这个 event 并清空槽位
+	 */
 	if (flags & _DRM_ROCKCHIP_VCNT_EVENT) {
 		e = rockchip_drm_add_vcnt_event(crtc, vblwait, file_priv);
 		priv->vcnt[pipe].event = e;
@@ -1876,7 +2077,7 @@ static const struct file_operations rockchip_drm_driver_fops = {
 	.open = drm_open,
 	.mmap = rockchip_gem_mmap,
 	.poll = drm_poll,
-	.read = drm_read,
+	.read = drm_read, //读在这里
 	.unlocked_ioctl = drm_ioctl,
 	.compat_ioctl = drm_compat_ioctl,
 	.release = drm_release,

@@ -32,38 +32,176 @@
 #include "drm_internal.h"
 
 /**
- * DOC: vblank handling
+ * DOC: vblank handling（垂直消隐处理）
  *
- * Vertical blanking plays a major role in graphics rendering. To achieve
- * tear-free display, users must synchronize page flips and/or rendering to
- * vertical blanking. The DRM API offers ioctls to perform page flips
- * synchronized to vertical blanking and wait for vertical blanking.
+ * ============================================================================
+ * 一、VBlank 的核心作用
+ * ============================================================================
  *
- * The DRM core handles most of the vertical blanking management logic, which
- * involves filtering out spurious interrupts, keeping race-free blanking
- * counters, coping with counter wrap-around and resets and keeping use counts.
- * It relies on the driver to generate vertical blanking interrupts and
- * optionally provide a hardware vertical blanking counter.
+ * 垂直消隐（Vertical Blanking，简称 VBlank）在图形渲染中扮演关键角色。
+ * 为了实现无撕裂的画面显示，用户必须将页面翻转和/或渲染操作同步到垂直消隐期。
  *
- * Drivers must initialize the vertical blanking handling core with a call to
- * drm_vblank_init(). Minimally, a driver needs to implement
- * &drm_crtc_funcs.enable_vblank and &drm_crtc_funcs.disable_vblank plus call
- * drm_crtc_handle_vblank() in it's vblank interrupt handler for working vblank
- * support.
+ * 什么是画面撕裂（Tearing）？
+ *   显示器正在扫描显示画面A的上半部分时，程序切换到了画面B，
+ *   导致显示器下半部分显示的是画面B，形成画面断裂现象。
  *
- * Vertical blanking interrupts can be enabled by the DRM core or by drivers
- * themselves (for instance to handle page flipping operations).  The DRM core
- * maintains a vertical blanking use count to ensure that the interrupts are not
- * disabled while a user still needs them. To increment the use count, drivers
- * call drm_crtc_vblank_get() and release the vblank reference again with
- * drm_crtc_vblank_put(). In between these two calls vblank interrupts are
- * guaranteed to be enabled.
+ * VBlank 如何解决撕裂？
+ *   在两帧画面之间的空白期（VBlank）进行页面切换，此时显示器
+ *   不在扫描显示，切换缓冲区不会被用户看到。
  *
- * On many hardware disabling the vblank interrupt cannot be done in a race-free
- * manner, see &drm_driver.vblank_disable_immediate and
- * &drm_driver.max_vblank_count. In that case the vblank core only disables the
- * vblanks after a timer has expired, which can be configured through the
- * ``vblankoffdelay`` module parameter.
+ *   时间线：
+ *   ┌────────┐ VBlank ┌────────┐ VBlank ┌────────┐
+ *   │Frame 1 │ ······ │Frame 2 │ ······ │Frame 3 │
+ *   └────────┘   ↑    └────────┘   ↑    └────────┘
+ *             在这里切换          在这里切换
+ *             不会撕裂            不会撕裂
+ *
+ * DRM API 提供的用户空间接口：
+ * - ioctl：执行与 VBlank 同步的页面翻转
+ * - ioctl：等待 VBlank 事件
+ *
+ * ============================================================================
+ * 二、DRM 核心层的职责
+ * ============================================================================
+ *
+ * DRM 核心负责处理大部分垂直消隐管理逻辑，包括：
+ *
+ * 1. 过滤杂散中断：
+ *    硬件可能产生错误的 VBlank 中断，核心层会识别并丢弃
+ *
+ * 2. 维护无竞态的计数器：
+ *    多线程访问 VBlank 计数器时保证数据一致性
+ *
+ * 3. 处理计数器回绕和重置：
+ *    硬件计数器溢出时（如 24 位计数器从 0xFFFFFF 变为 0），
+ *    核心层会正确处理，保证软件计数器持续递增
+ *
+ * 4. 维护使用计数（引用计数）：
+ *    跟踪有多少用户在使用 VBlank 中断，确保在有人使用时
+ *    不会被错误关闭
+ *
+ * 驱动的职责：
+ * - 必须：产生垂直消隐中断
+ * - 可选：提供硬件 VBlank 计数器（推荐，可提高精度）
+ *
+ * ============================================================================
+ * 三、驱动实现要求
+ * ============================================================================
+ *
+ * 最小实现（必需的三步）：
+ *
+ * 1. 初始化：调用 drm_vblank_init()
+ *    在驱动加载时初始化 VBlank 子系统
+ *
+ * 2. 实现回调函数：
+ *    - &drm_crtc_funcs.enable_vblank：使能 VBlank 硬件中断
+ *    - &drm_crtc_funcs.disable_vblank：禁用 VBlank 硬件中断
+ *
+ * 3. 中断处理：
+ *    在驱动的 VBlank 中断处理函数中调用 drm_crtc_handle_vblank()，
+ *    通知 DRM 核心 VBlank 事件已发生
+ *
+ * 示例代码结构：
+ *   static irqreturn_t my_irq_handler(int irq, void *arg) {
+ *       if (vblank_occurred)
+ *           drm_crtc_handle_vblank(crtc);  // ← 通知核心层
+ *       return IRQ_HANDLED;
+ *   }
+ *
+ * ============================================================================
+ * 四、VBlank 中断的使能/禁用机制
+ * ============================================================================
+ *
+ * VBlank 中断可以被以下两种方式启用：
+ * 1. DRM 核心层自动启用（响应用户空间请求）
+ * 2. 驱动主动启用（例如处理页面翻转操作）
+ *
+ * 引用计数管理：
+ * DRM 核心维护一个 VBlank 使用计数，确保在有用户需要时中断不会被禁用。
+ *
+ * API 使用模式：
+ *   drm_crtc_vblank_get(crtc);      // 引用计数 +1，保证中断开启
+ *   // ... 使用 VBlank 中断期间，中断保证不会被关闭 ...
+ *   drm_crtc_vblank_put(crtc);      // 引用计数 -1，允许关闭中断
+ *
+ * 实际应用场景：
+ *   // 等待下一个 VBlank 来翻转页面
+ *   drm_crtc_vblank_get(crtc);
+ *   setup_page_flip();
+ *   wait_for_vblank_event();
+ *   drm_crtc_vblank_put(crtc);
+ *
+ * ============================================================================
+ * 五、延迟禁用机制
+ * ============================================================================
+ *
+ * 为什么需要延迟禁用？主要有两个原因：
+ *
+ * 原因 1：硬件关闭中断不是瞬时的（存在竞态风险）
+ *
+ *   时序问题示例：
+ *   CPU 时间线：      软件写寄存器禁用中断 ────→ 认为中断已关闭
+ *                          |
+ *   硬件时间线：      VBlank发生 ─→ 产生中断 ─→ 寄存器生效，中断关闭
+ *                         |           |
+ *                         |           └─ 这个中断已经在路上了！
+ *                         |              CPU 必须处理它
+ *                         |
+ *                         └─ 硬件检测到 VBlank 在寄存器写入之前
+ *
+ *   后果：软件以为中断关了，但硬件还会发 1-2 个"意外"中断，
+ *        导致计数器出错或触发 WARN。
+ *
+ * 原因 2：避免频繁开关中断的性能损耗
+ *
+ *   典型场景（没有延迟禁用）：
+ *   用户程序：等待 VBlank → 收到信号 → 立即关闭中断
+ *            ↓ 过了 5ms
+ *            等待 VBlank → 又要开启中断
+ *            ↓ 过了 5ms
+ *            等待 VBlank → 又要开启中断
+ *            ...（每秒可能上百次）
+ *
+ *   每次开关中断的成本：
+ *   - 寄存器读写操作（慢）
+ *   - 中断控制器配置
+ *   - 可能触发硬件初始化
+ *   - CPU 缓存失效
+ *
+ *   有了延迟禁用（保持开启 5 秒）：
+ *   第一次请求 → 开启中断
+ *   后续请求  → 中断已经开着，直接用！
+ *             → 5 秒内没新请求才真正关闭
+ *   结果：大大减少开关次数，提升性能
+ *
+ * 解决方案：
+ * 当引用计数降为 0 时，VBlank 核心不会立即禁用中断，
+ * 而是启动一个定时器，在定时器超时后才真正禁用。
+ *
+ * 相关配置：
+ * - &drm_driver.vblank_disable_immediate：是否立即禁用（true=立即，false=延迟）
+ * - &drm_driver.max_vblank_count：硬件计数器最大值（影响回绕处理）
+ * - vblankoffdelay 模块参数：延迟禁用的时间（毫秒，默认 5000ms）
+ *
+ * 延迟禁用时序：
+ *   引用计数变为0 → 启动定时器（5秒） → 定时器到期 → 真正禁用中断
+ *   |               |                      |
+ *   |               ← 如果这期间有新请求，取消定时器
+ *   |
+ *   ← 避免频繁开关中断的开销
+ * 开关中断的实际成本
+ * 每次开关中断涉及：
+ * 1.写硬件寄存器：PCIe/AXI 总线访问，延迟几微秒到几十微秒
+ * 2.中断控制器配置：GIC（ARM）或 APIC（x86）需要同步状态
+ * 3.硬件初始化：某些芯片关闭中断会复位内部状态
+ * 4.缓存失效：寄存器映射的内存区域可能失效
+ * 实测数据（假设）：
+ * 1.开启中断：约 20μs
+ * 2.关闭中断：约 15μs
+ * 3.每次往返：35μs
+ * 如果每秒开关 200 次：
+ * 200 次/秒 × 35μs = 7000μs = 7ms相当于浪费了 0.7% 的 CPU 时间在无意义的开关操作上！
+ * 而延迟禁用后可能只开关 1-2 次，几乎没有损耗。
  */
 
 /* Retry timestamp calculation up to 3 times to satisfy
@@ -324,20 +462,41 @@ u64 drm_crtc_accurate_vblank_count(struct drm_crtc *crtc)
 }
 EXPORT_SYMBOL(drm_crtc_accurate_vblank_count);
 
+/**
+ * __disable_vblank - 禁用指定 CRTC 的 vblank 中断（内部函数）
+ * @dev: DRM 设备
+ * @pipe: CRTC 索引号（pipe 是历史术语，实际就是 CRTC 编号）
+ *
+ * 这个函数负责关闭硬件的 vblank 中断。它体现了 DRM 框架中新旧接口的兼容性设计：
+ *
+ * 调用路径优先级：
+ * 1. 优先尝试现代 KMS 接口：crtc->funcs->disable_vblank(crtc)
+ * 2. 降级到旧式驱动接口：dev->driver->disable_vblank(dev, pipe)
+ *
+ * 为什么需要两种方式？
+ * - 新驱动（KMS）：使用面向对象的 CRTC 回调，更清晰直观
+ * - 旧驱动（非KMS）：使用驱动级全局回调 + pipe 索引，兼容历史代码
+ */
 static void __disable_vblank(struct drm_device *dev, unsigned int pipe)
 {
+	/* 检查驱动是否支持 KMS（内核模式设置） */
 	if (drm_core_check_feature(dev, DRIVER_MODESET)) {
+		/* 现代方式：通过 pipe 索引获取对应的 CRTC 对象 */
 		struct drm_crtc *crtc = drm_crtc_from_index(dev, pipe);
 
+		/* 防御性检查：确保 CRTC 存在 */
 		if (WARN_ON(!crtc))
 			return;
 
+		/* 如果 CRTC 实现了 disable_vblank 回调，使用现代接口 */
 		if (crtc->funcs->disable_vblank) {
 			crtc->funcs->disable_vblank(crtc);
 			return;
 		}
+		/* 否则继续尝试旧式接口（下面的代码） */
 	}
 
+	/* 降级方案：使用驱动级别的旧式接口（非 KMS 驱动或 CRTC 未实现新接口） */
 	dev->driver->disable_vblank(dev, pipe);
 }
 
@@ -432,39 +591,148 @@ void drm_vblank_cleanup(struct drm_device *dev)
  * Returns:
  * Zero on success or a negative error code on failure.
  */
+/**
+ * drm_vblank_init - 初始化 DRM 设备的 VBlank 管理子系统
+ * @dev: DRM 设备
+ * @num_crtcs: 该设备拥有的 CRTC 数量
+ *
+ * 为每个 CRTC 分配并初始化 VBlank 跟踪结构，建立 VBlank 事件通知机制。
+ *
+ * 必须在驱动初始化的早期阶段调用，在任何 VBlank 相关操作之前完成。
+ *
+ * 返回值：0 表示成功，-ENOMEM 表示内存分配失败
+ */
 int drm_vblank_init(struct drm_device *dev, unsigned int num_crtcs)
 {
 	int ret = -ENOMEM;
 	unsigned int i;
 
+	/*
+	 * 初始化两把关键锁：
+	 *
+	 * vbl_lock: 保护 VBlank 引用计数和使能/禁用状态
+	 *   使用场景：drm_vblank_get/put 操作时需要持有
+	 *
+	 * vblank_time_lock: 保护时间戳相关操作（历史遗留，现在基本不用）
+	 *   大部分时间戳操作已改用 seqlock（每个 CRTC 独立锁）
+	 */
 	spin_lock_init(&dev->vbl_lock);
 	spin_lock_init(&dev->vblank_time_lock);
 
 	dev->num_crtcs = num_crtcs;
 
+	/*
+	 * 为每个 CRTC 分配一个 drm_vblank_crtc 结构。
+	 *
+	 * kcalloc：分配并清零，避免野指针和未初始化字段。
+	 *
+	 * 为什么是数组而非链表？
+	 * - CRTC 数量固定（初始化后不变）
+	 * - 通过 pipe 索引直接访问，O(1) 时间复杂度
+	 * - 内存连续，缓存友好
+	 */
 	dev->vblank = kcalloc(num_crtcs, sizeof(*dev->vblank), GFP_KERNEL);
 	if (!dev->vblank)
 		goto err;
 
+	/* 为每个 CRTC 初始化 VBlank 跟踪结构 */
 	for (i = 0; i < num_crtcs; i++) {
 		struct drm_vblank_crtc *vblank = &dev->vblank[i];
 
-		vblank->dev = dev;
-		vblank->pipe = i;
+		vblank->dev = dev;   /* 反向指针，指回 DRM 设备 */
+		vblank->pipe = i;    /* CRTC 索引号（0, 1, 2...） */
+
+		/*
+		 * 初始化等待队列：用于 drm_wait_vblank() 等阻塞接口。
+		 * 用户空间进程调用 DRM_IOCTL_WAIT_VBLANK 时会在此队列休眠，
+		 * VBlank 中断到来时唤醒所有等待者。
+		 */
 		init_waitqueue_head(&vblank->queue);
+
+		/*
+		 * 初始化延迟禁用定时器：
+		 *
+		 * vblank_disable_fn：定时器到期时的回调函数
+		 * 0：标志位（此处无特殊标志）
+		 *
+		 * 工作原理：
+		 *   当 VBlank 引用计数降为 0 时，不立即禁用中断，
+		 *   而是启动这个定时器（默认 5 秒）。
+		 *   如果 5 秒内没有新的 VBlank 请求，定时器到期才真正禁用。
+		 *   这样避免了频繁开关中断的开销。
+		 */
 		timer_setup(&vblank->disable_timer, vblank_disable_fn, 0);
+
+		/*
+		 * 初始化序列锁（seqlock）：
+		 *
+		 * 保护 vblank->count 和 vblank->time 的一致性。
+		 *
+		 * 为什么用 seqlock 而非普通自旋锁？
+		 * - 读多写少：大量读取 VBlank 计数和时间戳，极少写入（仅在中断时）
+		 * - 读者无锁：读者不需要加锁，通过序列号检测是否需要重试
+		 * - 写者优先：中断处理函数（写者）不会被读者阻塞
+		 */
 		seqlock_init(&vblank->seqlock);
 	}
 
 	DRM_INFO("Supports vblank timestamp caching Rev 2 (21.10.2013).\n");
 
-	/* Driver specific high-precision vblank timestamping supported? */
+	/*
+	 * 检查驱动是否提供了高精度时间戳查询接口：
+	 *
+	 * get_vblank_timestamp：驱动提供的回调函数，
+	 * 用于获取 VBlank 发生的精确时间戳（通常通过读取硬件计数器推算）。
+	 *
+	 * 有此接口的好处：
+	 * - 时间戳精度更高（微秒级甚至纳秒级）
+	 * - 可以支持"立即禁用 VBlank"模式（下面会检查）
+	 */
 	if (dev->driver->get_vblank_timestamp)
 		DRM_INFO("Driver supports precise vblank timestamp query.\n");
 	else
 		DRM_INFO("No driver support for vblank timestamp query.\n");
 
-	/* Must have precise timestamping for reliable vblank instant disable */
+	/*
+	 * 立即禁用模式的前提条件检查：
+	 *
+	 * vblank_disable_immediate = true：
+	 *   VBlank 引用计数降为 0 时立即禁用中断（不等 5 秒）
+	 *
+	 * 但这个模式有前提：必须有 get_vblank_timestamp 接口。
+	 *
+	 * 为什么？用一个具体场景说明：
+	 *
+	 * 假设 60Hz 显示器，中断在第 100 次 VBlank 时被立即关闭：
+	 *
+	 *   VBlank #100  → 中断触发，count=100，随后 refcount 降为 0，立即关闭中断
+	 *   VBlank #101  → 显示器照常刷新，但没有中断了，count 停留在 100
+	 *   VBlank #102  → 同上，count 仍然是 100
+	 *   ...
+	 *   VBlank #110  → 同上，count 仍然是 100
+	 *   VBlank #111  → 用户空间又来查询了，重新开启中断
+	 *
+	 * 问题来了：重新开启中断时，count 还是 100，但实际已经过了 111 次。
+	 * 系统需要把 count 从 100 补到 111，差值 = 11 次。
+	 *
+	 * 怎么算出这个差值 11？→ 看 drm_update_vblank_count()：
+	 *
+	 *   方法 1：硬件计数器（如果有的话）
+	 *     diff = 当前硬件计数 - 上次记录的硬件计数 = 111 - 100 = 11  ✓
+	 *
+	 *   方法 2：时间戳推算（需要 get_vblank_timestamp）
+	 *     diff = (当前时间戳 - 关闭时的时间戳) / 每帧时长
+	 *          = (111 * 16.6ms - 100 * 16.6ms) / 16.6ms = 11  ✓
+	 *
+	 *   方法 3：两者都没有
+	 *     diff = 0（直接放弃，计数器永久丢失 11 次）  ✗
+	 *
+	 * 所以：如果驱动没有 get_vblank_timestamp，方法 2 用不了，
+	 * 万一方法 1 也不可靠（比如硬件计数器会溢出或重置），
+	 * 中断一旦关闭就无法准确补回错过的次数。
+	 * 这种情况下，立即禁用太危险了，必须回退到延迟禁用模式
+	 * （延迟 5 秒不关中断，让计数器有时间保持准确）。
+	 */
 	if (dev->vblank_disable_immediate && !dev->driver->get_vblank_timestamp) {
 		dev->vblank_disable_immediate = false;
 		DRM_INFO("Setting vblank_disable_immediate to false because "
@@ -474,6 +742,7 @@ int drm_vblank_init(struct drm_device *dev, unsigned int num_crtcs)
 	return 0;
 
 err:
+	/* 分配失败，清零 CRTC 数量，防止后续代码误用 */
 	dev->num_crtcs = 0;
 	return ret;
 }
@@ -817,33 +1086,45 @@ u64 drm_crtc_vblank_count_and_time(struct drm_crtc *crtc,
 }
 EXPORT_SYMBOL(drm_crtc_vblank_count_and_time);
 
+
+/**
+ * send_vblank_event - 填充事件时间戳并发送给用户空间
+ *
+ * 根据事件类型，将 VBlank 序列号和时间戳填入用户空间的事件结构体，
+ * 然后通过 drm_send_event_locked() 投递到用户空间的 read() 队列。
+ *
+ * @seq: VBlank 序列号（从系统启动以来的 VBlank 总数）
+ * @now: VBlank 发生的精确时间戳（内核高精度单调时钟）
+ */
 static void send_vblank_event(struct drm_device *dev,
 		struct drm_pending_vblank_event *e,
 		u64 seq, ktime_t now)
 {
 	struct timespec64 tv;
 
+	/* 根据事件类型选择不同的数据格式 */
 	switch (e->event.base.type) {
-	case DRM_EVENT_VBLANK:
-	case DRM_EVENT_FLIP_COMPLETE:
+	case DRM_EVENT_VBLANK:        /* 用户等待 VBlank 的事件 */
+	case DRM_EVENT_FLIP_COMPLETE: /* Page flip 完成事件 */
+		/* 旧格式：秒 + 微秒（兼容旧版用户空间） */
 		tv = ktime_to_timespec64(now);
 		e->event.vbl.sequence = seq;
 		/*
-		 * e->event is a user space structure, with hardcoded unsigned
-		 * 32-bit seconds/microseconds. This is safe as we always use
-		 * monotonic timestamps since linux-4.15
+		 * 用户空间结构体用 32 位存储秒和微秒。
+		 * 安全性：Linux 4.15+ 已改用单调时钟，不会受系统时间调整影响。
 		 */
 		e->event.vbl.tv_sec = tv.tv_sec;
-		e->event.vbl.tv_usec = tv.tv_nsec / 1000;
+		e->event.vbl.tv_usec = tv.tv_nsec / 1000; /* 纳秒转微秒 */
 		break;
-	case DRM_EVENT_CRTC_SEQUENCE:
+	case DRM_EVENT_CRTC_SEQUENCE: /* 新式精确序列事件 */
+		/* 新格式：64 位纳秒时间戳（更高精度） */
 		if (seq)
 			e->event.seq.sequence = seq;
-		e->event.seq.time_ns = ktime_to_ns(now);
+		e->event.seq.time_ns = ktime_to_ns(now); /* 直接用纳秒 */
 		break;
 	}
 	trace_drm_vblank_event_delivered(e->base.file_priv, e->pipe, seq);
-	drm_send_event_locked(dev, &e->base);
+	drm_send_event_locked(dev, &e->base); /* 投递到用户空间 */
 }
 
 /**
@@ -899,15 +1180,33 @@ void drm_crtc_arm_vblank_event(struct drm_crtc *crtc,
 EXPORT_SYMBOL(drm_crtc_arm_vblank_event);
 
 /**
- * drm_crtc_send_vblank_event - helper to send vblank event after pageflip
- * @crtc: the source CRTC of the vblank event
- * @e: the event to send
+ * drm_crtc_send_vblank_event - 立即发送 VBlank 事件给用户空间
  *
- * Updates sequence # and timestamp on event for the most recently processed
- * vblank, and sends it to userspace.  Caller must hold event lock.
+ * 页面翻转（page flip）完成后的通知助手函数。
  *
- * See drm_crtc_arm_vblank_event() for a helper which can be used in certain
- * situation, especially to send out events for atomic commit operations.
+ * 与 drm_crtc_arm_vblank_event() 的区别：
+ *
+ *   arm_vblank_event：
+ *     "预装弹药"——把事件挂到等待列表，等下一次 VBlank 中断到来时自动发送。
+ *     适用于有 "GO 位" 机制的硬件（写入配置后，硬件保证在 VBlank 时刻原子生效）。
+ *
+ *   send_vblank_event（本函数）：
+ *     "立即开火"——获取当前最新的 VBlank 计数和时间戳，马上发送事件。
+ *     适用于驱动在中断处理函数中，已经确认硬件状态已切换，需要立即通知用户空间。
+ *
+ * 典型调用场景：
+ *   驱动的 VBlank/页面翻转中断处理函数中：
+ *     spin_lock(&dev->event_lock);
+ *     if (crtc_state->event) {
+ *         drm_crtc_send_vblank_event(crtc, crtc_state->event);
+ *         crtc_state->event = NULL;
+ *     }
+ *     spin_unlock(&dev->event_lock);
+ *
+ * 注意：调用者必须持有 dev->event_lock 自旋锁。
+ *
+ * @crtc: 产生 VBlank 事件的 CRTC
+ * @e: 待发送的事件
  */
 void drm_crtc_send_vblank_event(struct drm_crtc *crtc,
 				struct drm_pending_vblank_event *e)
@@ -918,13 +1217,30 @@ void drm_crtc_send_vblank_event(struct drm_crtc *crtc,
 	ktime_t now;
 
 	if (dev->num_crtcs > 0) {
+		/*
+		 * 正常路径：设备有 CRTC（绝大多数情况）
+		 * 从 VBlank 计数器获取最新的序列号和对应的精确时间戳。
+		 * drm_vblank_count_and_time() 使用 seqlock 保护，
+		 * 确保 seq 和 now 是同一个 VBlank 时刻的一致快照。
+		 */
 		seq = drm_vblank_count_and_time(dev, pipe, &now);
 	} else {
+		/*
+		 * 降级路径：设备没有 CRTC（极少见，如纯渲染设备）
+		 * 没有硬件 VBlank 计数器，序列号设为 0，
+		 * 时间戳用当前单调时钟替代。
+		 */
 		seq = 0;
 
 		now = ktime_get();
 	}
 	e->pipe = pipe;
+	/*
+	 * send_vblank_event() 会根据事件类型填充用户空间结构体：
+	 * - DRM_EVENT_VBLANK / DRM_EVENT_FLIP_COMPLETE：填充 tv_sec + tv_usec + sequence
+	 * - DRM_EVENT_CRTC_SEQUENCE：填充 time_ns + sequence
+	 * 然后通过 drm_send_event_locked() 将事件投递到用户空间的 read() 队列。
+	 */
 	send_vblank_event(dev, e, seq, now);
 }
 EXPORT_SYMBOL(drm_crtc_send_vblank_event);
