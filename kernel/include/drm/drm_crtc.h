@@ -902,247 +902,388 @@ enum vop_dump_status {
 #endif
 
 /**
- * struct drm_crtc - central CRTC control structure
+ * struct drm_crtc - CRTC（显示控制器）核心控制结构体
  *
- * Each CRTC may have one or more connectors associated with it.  This structure
- * allows the CRTC to be controlled.
+ * 【CRTC 是什么？】
+ * CRTC（Cathode Ray Tube Controller，阴极射线管控制器）这个名字来自 CRT 时代，
+ * 在现代显示系统中，它是"显示流水线的定时主控"：
+ *   - 从帧缓冲（Framebuffer）中读取像素数据
+ *   - 按照 display mode（分辨率、刷新率）产生精确的像素时钟和行/帧同步信号
+ *   - 将像素流送往 Encoder → Connector → 物理显示设备
+ *
+ * 【在 Rockchip VOP2 中的对应关系】
+ *   一个 drm_crtc = VOP2 中的一个 VP（Video Port）
+ *   RK3568 有 VP0、VP1、VP2 三个 VP，因此有三个 drm_crtc。
+ *   每个 VP 可以绑定不同的显示接口（HDMI、MIPI DSI、eDP 等）。
+ *
+ * 【显示流水线全貌】
+ *
+ *   Framebuffer（GEM buffer，物理内存中的像素数组）
+ *        │ DMA 读取（VOP2 通过 IOMMU 从 DDR 搬运像素）
+ *        ▼
+ *   drm_plane（Win 图层，负责缩放、格式转换、Alpha 合成）
+ *        │ 多图层合成
+ *        ▼
+ *   drm_crtc（VP，产生行/帧时序，控制整帧输出节奏）
+ *        │ 像素流 + 同步信号
+ *        ▼
+ *   drm_encoder（将 CRTC 并行像素流转换为接口专用信号，如 TMDS/MIPI）
+ *        │
+ *        ▼
+ *   drm_connector（物理接口，HDMI/DSI/eDP，连接真实显示器）
+ *
+ * 【原子提交与 CRTC state】
+ * 现代驱动使用原子（atomic）模式：所有参数修改先写入 drm_crtc_state，
+ * 通过 atomic_check 验证合法性，再通过 atomic_commit 一次性生效，
+ * 保证"全成功或全失败"的事务语义。
+ * 结构体中以"Should only be used by legacy drivers"标注的字段
+ * 是为了兼容旧版 IOCTL，原子驱动应使用对应的 drm_crtc_state 字段。
+ *
+ * 【VBlank 与帧同步】
+ * CRTC 驱动显示扫描，每扫完一帧进入垂直消隐期（VBlank）。
+ * VBlank 是更新帧缓冲的安全窗口：此期间切换 framebuffer 不会产生撕裂。
+ * Page flip、fence signal 等操作都在 VBlank 中完成。
  */
 struct drm_crtc {
-	/** @dev: parent DRM device */
-	struct drm_device *dev;
-	/** @port: OF node used by drm_of_find_possible_crtcs(). */
-	struct device_node *port;
 	/**
-	 * @head:
+	 * @dev: 所属的 DRM 设备（struct drm_device）
+	 * 通过此指针访问全局资源，如 mode_config、event_lock 等。
+	 */
+	struct drm_device *dev;
+
+	/**
+	 * @port: 设备树（Device Tree）中对应的 OF 节点
 	 *
-	 * List of all CRTCs on @dev, linked from &drm_mode_config.crtc_list.
-	 * Invariant over the lifetime of @dev and therefore does not need
-	 * locking.
+	 * 用于 drm_of_find_possible_crtcs()，通过解析 DTS 的 port/endpoint
+	 * 拓扑确定哪些 encoder 可以连接到本 CRTC。
+	 *
+	 * 在 Rockchip VOP2 的 DTS 中，每个 VP 有一个 port 节点：
+	 *   vop: vop@fe040000 {
+	 *       vp0: port@0 { ... }   ← VP0 的 port，即 drm_crtc[0].port
+	 *       vp1: port@1 { ... }   ← VP1 的 port，即 drm_crtc[1].port
+	 *   }
+	 */
+	struct device_node *port;
+
+	/**
+	 * @head: 全局 CRTC 链表节点
+	 *
+	 * 链入 drm_mode_config.crtc_list，DRM 核心通过此链表遍历所有 CRTC。
+	 * 在 drm_crtc_init_with_planes() 中初始化，设备生命周期内不变，无需加锁。
+	 * 遍历宏：for_each_crtc(dev, crtc)
 	 */
 	struct list_head head;
 
-	/** @name: human readable name, can be overwritten by the driver */
+	/**
+	 * @name: CRTC 的可读名称（如 "crtc-0"）
+	 *
+	 * 用于 debugfs、日志输出等。驱动可在注册时覆盖默认名称，
+	 * 例如 Rockchip 驱动会设为 "vp0"、"vp1" 等与硬件对应的名字。
+	 */
 	char *name;
 
 	/**
-	 * @mutex:
+	 * @mutex: CRTC 状态的读写锁（struct drm_modeset_lock，基于 ww_mutex）
 	 *
-	 * This provides a read lock for the overall CRTC state (mode, dpms
-	 * state, ...) and a write lock for everything which can be update
-	 * without a full modeset (fb, cursor data, CRTC properties ...). A full
-	 * modeset also need to grab &drm_mode_config.connection_mutex.
+	 * 【锁语义】
+	 *   读锁（共享）：保护整体 CRTC 状态（mode、dpms 状态等）。
+	 *   写锁（独占）：保护可在不触发完整 modeset 前提下更新的内容，
+	 *                 如 framebuffer 切换（page flip）、cursor 位置、
+	 *                 CRTC property 值等。
 	 *
-	 * For atomic drivers specifically this protects @state.
+	 * 【完整 modeset 的加锁要求】
+	 *   需要同时持有：
+	 *     1. 本 CRTC 的 @mutex（写锁）
+	 *     2. drm_mode_config.connection_mutex（全局连接拓扑锁）
+	 *   因为 modeset 可能改变 encoder/connector 的连接关系。
+	 *
+	 * 【原子驱动的特殊说明】
+	 *   @mutex 保护 @state 指针（当前 drm_crtc_state）。
+	 *   非阻塞原子提交在硬件提交阶段不持有 @mutex，而是通过
+	 *   drm_atomic_state 快照指针或严格操作顺序（drm_crtc_commit）安全访问。
 	 */
 	struct drm_modeset_lock mutex;
 
-	/** @base: base KMS object for ID tracking etc. */
+	/**
+	 * @base: KMS 基类对象（struct drm_mode_object）
+	 *
+	 * 提供：唯一 ID（uint32_t）、对象类型（DRM_MODE_OBJECT_CRTC）、
+	 * property 实例表、动态引用计数。
+	 * 用户空间通过此 ID 在 IOCTL 中引用本 CRTC。
+	 */
 	struct drm_mode_object base;
 
 	/**
-	 * @primary:
-	 * Primary plane for this CRTC. Note that this is only
-	 * relevant for legacy IOCTL, it specifies the plane implicitly used by
-	 * the SETCRTC and PAGE_FLIP IOCTLs. It does not have any significance
-	 * beyond that.
+	 * @primary: 主显示图层（Primary Plane）
+	 *
+	 * 仅供遗留 IOCTL 使用（SETCRTC、PAGE_FLIP），指定这两个 IOCTL
+	 * 隐式操作的 plane。原子驱动应直接通过 drm_plane_state 操作 plane。
+	 * 在 Rockchip VOP2 中，primary plane 对应 VP 的主 Win 图层（Win0）。
 	 */
 	struct drm_plane *primary;
 
 	/**
-	 * @cursor:
-	 * Cursor plane for this CRTC. Note that this is only relevant for
-	 * legacy IOCTL, it specifies the plane implicitly used by the SETCURSOR
-	 * and SETCURSOR2 IOCTLs. It does not have any significance
-	 * beyond that.
+	 * @cursor: 光标图层（Cursor Plane）
+	 *
+	 * 仅供遗留 IOCTL 使用（SETCURSOR/SETCURSOR2），指定光标 IOCTL
+	 * 隐式操作的 plane。硬件光标是独立的小尺寸图层（如 64×64 ARGB），
+	 * 由专用硬件叠加在画面顶层，响应延迟极低，无需 CPU 重绘整帧。
+	 * 原子驱动应通过 drm_plane_state.crtc_x/y 获取光标坐标。
 	 */
 	struct drm_plane *cursor;
 
 	/**
-	 * @index: Position inside the mode_config.list, can be used as an array
-	 * index. It is invariant over the lifetime of the CRTC.
+	 * @index: CRTC 在 mode_config.crtc_list 中的位置索引（从 0 起）
+	 *
+	 * 设备生命周期内不变，可直接用作数组下标，例如：
+	 *   priv->vblank[crtc->index]   ← VBlank 管理数组
+	 *   priv->vcnt[crtc->index]     ← Rockchip vcnt 事件槽位
+	 * 与 drm_crtc_index(crtc) 返回值相同。
 	 */
 	unsigned index;
 
 	/**
-	 * @cursor_x: Current x position of the cursor, used for universal
-	 * cursor planes because the SETCURSOR IOCTL only can update the
-	 * framebuffer without supplying the coordinates. Drivers should not use
-	 * this directly, atomic drivers should look at &drm_plane_state.crtc_x
-	 * of the cursor plane instead.
+	 * @cursor_x / @cursor_y: 光标当前位置（遗留字段）
+	 *
+	 * 遗留 SETCURSOR IOCTL 只能更新 cursor framebuffer，无法同时更新坐标，
+	 * 这两个字段用于在两次 IOCTL 间记忆光标位置。
+	 * 原子驱动不应使用，应读取 cursor plane 的 drm_plane_state.crtc_x/y。
 	 */
 	int cursor_x;
-	/**
-	 * @cursor_y: Current y position of the cursor, used for universal
-	 * cursor planes because the SETCURSOR IOCTL only can update the
-	 * framebuffer without supplying the coordinates. Drivers should not use
-	 * this directly, atomic drivers should look at &drm_plane_state.crtc_y
-	 * of the cursor plane instead.
-	 */
 	int cursor_y;
 
 	/**
-	 * @enabled:
+	 * @enabled: CRTC 是否处于启用状态（遗留字段）
 	 *
-	 * Is this CRTC enabled? Should only be used by legacy drivers, atomic
-	 * drivers should instead consult &drm_crtc_state.enable and
-	 * &drm_crtc_state.active. Atomic drivers can update this by calling
-	 * drm_atomic_helper_update_legacy_modeset_state().
+	 * 仅供遗留驱动使用。原子驱动应查询：
+	 *   drm_crtc_state.enable  ← CRTC 是否在显示链路中（逻辑启用）
+	 *   drm_crtc_state.active  ← CRTC 是否实际输出信号（区分 DPMS 关闭）
+	 * 由 drm_atomic_helper_update_legacy_modeset_state() 在提交后同步更新。
 	 */
 	bool enabled;
 
 	/**
-	 * @mode:
+	 * @mode: 当前生效的显示模式（遗留字段）
 	 *
-	 * Current mode timings. Should only be used by legacy drivers, atomic
-	 * drivers should instead consult &drm_crtc_state.mode. Atomic drivers
-	 * can update this by calling
-	 * drm_atomic_helper_update_legacy_modeset_state().
+	 * 描述显示时序：分辨率（hdisplay × vdisplay）、刷新率、像素时钟、
+	 * 行/帧同步脉冲宽度和位置（HSync/VSync timing）等。
+	 * 仅供遗留驱动使用，原子驱动应查询 drm_crtc_state.mode。
 	 */
 	struct drm_display_mode mode;
 
 	/**
-	 * @hwmode:
+	 * @hwmode: 实际写入硬件寄存器的显示模式（遗留字段）
 	 *
-	 * Programmed mode in hw, after adjustments for encoders, crtc, panel
-	 * scaling etc. Should only be used by legacy drivers, for high
-	 * precision vblank timestamps in
-	 * drm_calc_vbltimestamp_from_scanoutpos().
+	 * 与 @mode 的区别：@hwmode 是经过 encoder、panel、CRTC 各种
+	 * 缩放/补偿调整之后，最终编程进硬件的时序参数（如行数有 padding）。
 	 *
-	 * Note that atomic drivers should not use this, but instead use
-	 * &drm_crtc_state.adjusted_mode. And for high-precision timestamps
-	 * drm_calc_vbltimestamp_from_scanoutpos() used &drm_vblank_crtc.hwmode,
-	 * which is filled out by calling drm_calc_timestamping_constants().
+	 * 用途：drm_calc_vbltimestamp_from_scanoutpos() 用此计算高精度
+	 * VBlank 时间戳（需要精确的硬件行数和像素时钟）。
+	 * 原子驱动应使用 drm_crtc_state.adjusted_mode；
+	 * VBlank 时间戳计算请用 drm_vblank_crtc.hwmode。
 	 */
 	struct drm_display_mode hwmode;
 
 	/**
-	 * @x:
-	 * x position on screen. Should only be used by legacy drivers, atomic
-	 * drivers should look at &drm_plane_state.crtc_x of the primary plane
-	 * instead. Updated by calling
-	 * drm_atomic_helper_update_legacy_modeset_state().
+	 * @x / @y: CRTC 输出在虚拟桌面坐标系中的起始坐标（遗留字段）
+	 *
+	 * 用于多屏拼接场景，表示本 CRTC 覆盖的区域在大桌面中的偏移。
+	 * 原子驱动应查询 primary plane 的 drm_plane_state.crtc_x/y。
 	 */
 	int x;
-	/**
-	 * @y:
-	 * y position on screen. Should only be used by legacy drivers, atomic
-	 * drivers should look at &drm_plane_state.crtc_y of the primary plane
-	 * instead. Updated by calling
-	 * drm_atomic_helper_update_legacy_modeset_state().
-	 */
 	int y;
 
-	/** @funcs: CRTC control functions */
+	/**
+	 * @funcs: CRTC 操作函数表（struct drm_crtc_funcs）
+	 *
+	 * 驱动实现的核心回调，关键回调包括：
+	 *   .enable_vblank()           ← 启用 VBlank 中断（VOP2: vop2_enable_vblank）
+	 *   .disable_vblank()          ← 禁用 VBlank 中断
+	 *   .get_vblank_counter()      ← 读取硬件帧计数器
+	 *   .atomic_duplicate_state()  ← 复制 drm_crtc_state（原子提交前快照）
+	 *   .atomic_destroy_state()    ← 销毁 drm_crtc_state
+	 *   .destroy()                 ← CRTC 销毁时的资源清理
+	 * Rockchip VOP2 在 vop2_crtc_funcs 中实现这些回调。
+	 */
 	const struct drm_crtc_funcs *funcs;
 
 	/**
-	 * @gamma_size: Size of legacy gamma ramp reported to userspace. Set up
-	 * by calling drm_mode_crtc_set_gamma_size().
+	 * @gamma_size: 遗留 Gamma LUT 的条目数（典型值：256）
+	 *
+	 * 由 drm_mode_crtc_set_gamma_size() 设置，告知用户空间
+	 * 该 CRTC 支持的 Gamma 校正精度。
+	 * 原子驱动应通过 GAMMA_LUT property（Blob 类型）传递 Gamma 表。
 	 */
 	uint32_t gamma_size;
 
 	/**
-	 * @gamma_store: Gamma ramp values used by the legacy SETGAMMA and
-	 * GETGAMMA IOCTls. Set up by calling drm_mode_crtc_set_gamma_size().
+	 * @gamma_store: 遗留 Gamma LUT 数据存储
+	 *
+	 * 存储用户空间通过 DRM_IOCTL_MODE_SETGAMMA 设置的 R/G/B 三通道 Gamma 值。
+	 * 格式：[R0..R255, G0..G255, B0..B255]，共 gamma_size×3 个 uint16_t。
 	 */
 	uint16_t *gamma_store;
 
-	/** @helper_private: mid-layer private data */
+	/**
+	 * @helper_private: 中间层（helper）私有数据（struct drm_crtc_helper_funcs）
+	 *
+	 * 包含 atomic commit 流程各阶段的 helper 回调：
+	 *   .atomic_check()    ← 验证新状态合法性（检查 mode、plane 兼容性等）
+	 *   .atomic_begin()    ← 开始硬件更新前的准备（如获取 VBlank 参考）
+	 *   .atomic_flush()    ← 提交硬件更新，写入寄存器（通常在 VBlank 期间生效）
+	 *   .atomic_enable()   ← 启用 CRTC 输出（VP 上电、PLL 启动）
+	 *   .atomic_disable()  ← 关闭 CRTC 输出（VP 下电）
+	 * Rockchip VOP2 在 vop2_crtc_helper_funcs 中实现。
+	 */
 	const struct drm_crtc_helper_funcs *helper_private;
 
-	/** @properties: property tracking for this CRTC */
+	/**
+	 * @properties: 该 CRTC 上挂载的 property 实例表
+	 *
+	 * 存储已附加到本 CRTC 的所有 drm_property 的实例值。
+	 * 原子驱动中，可变 property 值存储在 drm_crtc_state 中，
+	 * @properties 仅用于不可变（IMMUTABLE）property 或遗留接口。
+	 * 用户空间通过 DRM_IOCTL_MODE_OBJ_GETPROPERTIES 枚举这些属性。
+	 * 常见属性：ACTIVE、MODE_ID、OUT_FENCE_PTR、GAMMA_LUT、CTM 等。
+	 */
 	struct drm_object_properties properties;
 
 	/**
-	 * @state:
+	 * @state: 当前原子状态快照（struct drm_crtc_state）
 	 *
-	 * Current atomic state for this CRTC.
+	 * 【核心字段，必须理解】
 	 *
-	 * This is protected by @mutex. Note that nonblocking atomic commits
-	 * access the current CRTC state without taking locks. Either by going
-	 * through the &struct drm_atomic_state pointers, see
-	 * for_each_oldnew_crtc_in_state(), for_each_old_crtc_in_state() and
-	 * for_each_new_crtc_in_state(). Or through careful ordering of atomic
-	 * commit operations as implemented in the atomic helpers, see
-	 * &struct drm_crtc_commit.
+	 * 指向本 CRTC 当前生效的原子状态，包含：
+	 *   .enable        ← CRTC 是否在显示链路中（逻辑启用）
+	 *   .active        ← CRTC 是否实际输出信号（区分 DPMS 关闭）
+	 *   .mode          ← 当前显示模式（逻辑模式）
+	 *   .adjusted_mode ← 实际写入硬件的模式
+	 *   .plane_mask    ← 此 CRTC 使用的 plane 位掩码
+	 *   .commit        ← 最近一次提交的 drm_crtc_commit 指针
+	 *
+	 * 【保护机制与无锁访问】
+	 * 正常路径：@state 由 @mutex（写锁）保护。
+	 *
+	 * 非阻塞原子提交（工作队列中执行）不持有 @mutex，通过两种安全方式访问：
+	 *
+	 *   方式1：通过 drm_atomic_state 中的状态快照（check 阶段冻结，无竞争）：
+	 *     for_each_oldnew_crtc_in_state(state, crtc, old_state, new_state, i) {
+	 *         // old_state：提交前的状态（只读）
+	 *         // new_state：提交后期望的状态（只读）
+	 *     }
+	 *
+	 *   方式2：原子 helper 在 drm_atomic_helper_swap_state()（将 new_state
+	 *           写入 @state）之前完成对旧状态的所有操作，之后访问新状态，
+	 *           通过严格操作顺序避免竞争（见 struct drm_crtc_commit）。
 	 */
 	struct drm_crtc_state *state;
 
 	/**
-	 * @commit_list:
+	 * @commit_list: 待处理提交的链表（struct drm_crtc_commit）
 	 *
-	 * List of &drm_crtc_commit structures tracking pending commits.
-	 * Protected by @commit_lock. This list holds its own full reference,
-	 * as does the ongoing commit.
+	 * 【drm_crtc_commit 的作用】
+	 * 一次原子提交在本 CRTC 上经历三个里程碑（completion）：
+	 *   flip_done    ← VBlank 触发，硬件已切换到新帧（page flip 完成）
+	 *   hw_done      ← 硬件寄存器写入完成（可以开始下一次 check）
+	 *   cleanup_done ← 旧 framebuffer 引用释放完毕（可以 unpin/free）
 	 *
-	 * "Note that the commit for a state change is also tracked in
-	 * &drm_crtc_state.commit. For accessing the immediately preceding
-	 * commit in an atomic update it is recommended to just use that
-	 * pointer in the old CRTC state, since accessing that doesn't need
-	 * any locking or list-walking. @commit_list should only be used to
-	 * stall for framebuffer cleanup that's signalled through
-	 * &drm_crtc_commit.cleanup_done."
+	 * @commit_list 挂的是所有"尚未走完 cleanup_done 阶段"的提交，
+	 * 用于在旧 framebuffer 真正可以释放前进行等待，
+	 * 防止 GPU 或 CRTC 还在读的 framebuffer 被提前释放。
+	 *
+	 * 访问提交历史的推荐方式：
+	 *   - 若只需上一次提交：用 old_crtc_state->commit 指针，无需加锁
+	 *   - @commit_list 仅用于等待 cleanup_done（framebuffer 清理同步）
+	 *
+	 * 受 @commit_lock（spinlock）保护。
 	 */
 	struct list_head commit_list;
 
 	/**
-	 * @commit_lock:
+	 * @commit_lock: 保护 @commit_list 的自旋锁
 	 *
-	 * Spinlock to protect @commit_list.
+	 * 使用 spinlock 而非 mutex 的原因：
+	 * framebuffer 清理（cleanup_done signal）可能在 VBlank 中断上下文中触发，
+	 * spinlock 可在中断上下文中安全使用，mutex 不行。
 	 */
 	spinlock_t commit_lock;
 
 #ifdef CONFIG_DEBUG_FS
 	/**
-	 * @debugfs_entry:
+	 * @debugfs_entry: 该 CRTC 的 debugfs 目录节点
 	 *
-	 * Debugfs directory for this CRTC.
+	 * 挂载在 /sys/kernel/debug/dri/<card>/crtc-<N>/ 下，
+	 * 提供 CRTC 状态、VBlank 统计、硬件寄存器 dump 等调试信息。
+	 * Rockchip VOP2 驱动在此目录额外注册 vop_regs、underrun 等节点。
 	 */
 	struct dentry *debugfs_entry;
 #endif
 
 	/**
-	 * @crc:
+	 * @crc: CRC 捕获配置（struct drm_crtc_crc）
 	 *
-	 * Configuration settings of CRC capture.
+	 * 支持硬件 CRC 校验功能：VOP2/CRTC 对每帧输出数据计算 CRC 值，
+	 * 内核将其上报到 debugfs，用户空间（如 IGT 测试框架）读取并验证
+	 * 帧内容是否符合预期，实现"无像素截图的图像正确性验证"。
+	 * 包含 source（CRC 来源选择）、entries（环形缓冲区）、wait_queue 等。
 	 */
 	struct drm_crtc_crc crc;
 
 	/**
-	 * @fence_context:
+	 * @fence_context: CRTC out-fence timeline 的上下文 ID
 	 *
-	 * timeline context used for fence operations.
+	 * 每个 CRTC 维护一条独立的 fence timeline，追踪该 CRTC 上帧的完成顺序。
+	 * @fence_context 由 dma_fence_context_alloc() 分配，全局唯一。
+	 *
+	 * 【OUT_FENCE_PTR property 的工作原理】
+	 * 用户空间在 atomic commit 时可通过 OUT_FENCE_PTR property 请求 fence fd：
+	 *   1. 内核用 @fence_context + @fence_seqno 创建一个 dma_fence
+	 *   2. 将 fence 封装为 sync_file fd 返回给用户空间
+	 *   3. CRTC 在 VBlank 完成本次 page flip 后 signal 此 fence
+	 *   4. 用户空间等待该 fd，确认帧已上屏后再准备下一帧
+	 * 这实现了"CRTC 上屏完成"的显式同步通知。
 	 */
 	unsigned int fence_context;
 
 	/**
-	 * @fence_lock:
+	 * @fence_lock: 保护 fence timeline 操作的自旋锁
 	 *
-	 * spinlock to protect the fences in the fence_context.
+	 * 保护基于 @fence_context + @fence_seqno 的 fence 创建操作，
+	 * 防止并发创建时 seqno 不单调。
+	 * 使用 spinlock 是因为 fence signal 在 VBlank 中断上下文中发生。
 	 */
 	spinlock_t fence_lock;
+
 	/**
-	 * @fence_seqno:
+	 * @fence_seqno: CRTC fence timeline 的序列号（单调递增）
 	 *
-	 * Seqno variable used as monotonic counter for the fences
-	 * created on the CRTC's timeline.
+	 * 每次为本 CRTC 创建新的 out-fence 时 seqno 自增 1。
+	 * seqno 较小的 fence 先被 signal（帧按顺序上屏），保证 timeline 顺序语义。
 	 */
 	unsigned long fence_seqno;
 
 	/**
-	 * @timeline_name:
+	 * @timeline_name: fence timeline 的可读名称（最长 31 字符）
 	 *
-	 * The name of the CRTC's fence timeline.
+	 * 通常格式为 "CRTC:<id>-<name>"，例如 "CRTC:31-vp0"。
+	 * 在 /sys/kernel/debug/sync/info 或 sync_file 信息中可见，【笔记钩子】
+	 * 方便调试时识别 fence 属于哪个 CRTC 的哪一帧。
 	 */
 	char timeline_name[32];
 
 #if defined(CONFIG_ROCKCHIP_DRM_DEBUG)
 	/**
-	 * @vop_dump_status the status of vop dump control
-	 * @vop_dump_list_head the list head of vop dump list
-	 * @vop_dump_list_init_flag init once
-	 * @vop_dump_times control the dump times
-	 * @frme_count the frame of dump buf
+	 * Rockchip VOP dump 调试功能（CONFIG_ROCKCHIP_DRM_DEBUG 专用）【笔记钩子】
+	 *
+	 * 提供在运行时抓取 VOP2 输出帧（raw pixel data）的调试能力，
+	 * 类似"帧截图"，用于现场排查显示异常问题。
+	 * 触发方式：echo 1 > /sys/kernel/debug/dri/0/vop_dump/dump
+	 *
+	 * @vop_dump_status:         dump 状态机（DUMP_DISABLE / DUMP_KEEP）
+	 * @vop_dump_list_head:      已捕获帧 buffer 的链表头（struct vop_dump_list）
+	 * @vop_dump_list_init_flag: 链表是否已初始化（防止重复初始化）
+	 * @vop_dump_times:          期望 dump 的帧数（0 表示持续抓取）
+	 * @frame_count:             已成功 dump 的帧计数
 	 */
 	enum vop_dump_status vop_dump_status;
 	struct list_head vop_dump_list_head;
