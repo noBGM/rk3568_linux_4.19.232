@@ -349,11 +349,16 @@ struct drm_mode_config_funcs {
  * enumerated by the driver are added here, as are global properties.  Some
  * global restrictions are also here, e.g. dimension restrictions.
  */
+
 /**
  * struct drm_mode_config - DRM模式设置（modeset）核心配置结构体
- *
- * 该结构体是DRM驱动中模式设置子系统的核心，管理显示模式（分辨率/刷新率）、CRTC/连接器/编码器的拓扑关系、
- * 锁机制、ID分配等关键资源，是用户态（如Xorg、Wayland）与内核态交互显示参数的核心载体。
+ * drm_mode_config
+ * 定义：KMS 子系统的全局资源管理器与配置中心，是整个 KMS 的 “大脑”，归属 struct drm_device 管理。
+ * 核心作用：
+ * 枚举并管理所有 KMS 硬件对象（CRTC/Plane/Encoder/Connector）；
+ * 存储全局显示配置（如优选分辨率、帧率限制）；
+ * 管理原子事务、vblank 事件、热插拔事件；
+ * 提供全局锁保护 KMS 资源。
  */
 struct drm_mode_config {
 	/**
@@ -422,39 +427,90 @@ struct drm_mode_config {
 	struct list_head fb_list;
 
 	/**
-	 * @connector_list_lock: Protects @num_connector and
-	 * @connector_list and @connector_free_list.
+	 * @connector_list_lock: 保护 @num_connector、@connector_list 和
+	 * @connector_free_list 的自旋锁。
+	 *
+	 * 使用 spinlock（而非 mutex）的原因：
+	 * connector 的引用计数归零可能发生在中断上下文（如 HPD 中断处理路径），
+	 * 此时需要能在不可睡眠的环境下安全操作链表，spinlock 满足此要求。
+	 * 内部使用 irqsave 变体（spin_lock_irqsave）防止中断嵌套死锁。
 	 */
 	spinlock_t connector_list_lock;
+
 	/**
-	 * @num_connector: Number of connectors on this device. Protected by
-	 * @connector_list_lock.
+	 * @num_connector: 当前已注册的 connector 数量。
+	 * 受 @connector_list_lock 保护。
+	 * 每次 drm_connector_init() 时 +1，drm_connector_cleanup() 时 -1。
 	 */
 	int num_connector;
+
 	/**
-	 * @connector_ida: ID allocator for connector indices.
+	 * @connector_ida: connector 索引的 ID 分配器。
+	 *
+	 * 为每个 connector 分配唯一的整型索引（connector->index），
+	 * 该索引用于用户空间通过 ioctl 枚举 connector 时的标识。
+	 * 与 drm_mode_object 的全局 ID（connector->base.id）不同：
+	 *   - base.id：全局唯一，跨所有 KMS 对象类型
+	 *   - index：仅在 connector 类型内唯一，从 0 起连续分配
 	 */
 	struct ida connector_ida;
+
 	/**
-	 * @connector_list:
+	 * @connector_list: 所有已注册 connector 的主链表。
 	 *
-	 * List of connector objects linked with &drm_connector.head. Protected
-	 * by @connector_list_lock. Only use drm_for_each_connector_iter() and
-	 * &struct drm_connector_list_iter to walk this list.
+	 * 通过 drm_connector.head 成员挂入，受 @connector_list_lock 保护。
+	 *
+	 * ## 遍历规则（重要）
+	 *
+	 * 禁止直接用 list_for_each_entry 遍历此链表，必须使用：
+	 *   drm_for_each_connector_iter(conn, &iter)
+	 * 配合 struct drm_connector_list_iter 使用。
+	 *
+	 * 原因：遍历过程中可能发生 connector 的引用计数归零（如热拔出），
+	 * drm_connector_list_iter 内部会安全地处理这种情况，防止访问已释放的内存。
+	 * 直接遍历在持锁期间调用 destroy 会导致死锁或 use-after-free。
 	 */
 	struct list_head connector_list;
+
 	/**
-	 * @connector_free_list:
+	 * @connector_free_list: 等待异步释放的 connector 延迟释放队列。
 	 *
-	 * List of connector objects linked with &drm_connector.free_head.
-	 * Protected by @connector_list_lock. Used by
-	 * drm_for_each_connector_iter() and
-	 * &struct drm_connector_list_iter to savely free connectors using
-	 * @connector_free_work.
+	 * ## 为什么需要延迟释放？
+	 *
+	 * connector 的释放（destroy 回调）可能需要睡眠（如释放 EDID、
+	 * 注销 sysfs、unmap 内存等），但引用计数归零的时刻可能在持有
+	 * @connector_list_lock（spinlock）的上下文中，spinlock 不允许睡眠。
+	 *
+	 * 解决方案（两阶段释放）：
+	 *   阶段一（原子上下文，持锁中）：
+	 *     __drm_connector_put_safe() 中引用计数归零时，
+	 *     仅将 connector 通过 llist_add() 挂入此队列，
+	 *     然后 schedule_work() 触发异步工作。
+	 *
+	 *   阶段二（工作队列，可睡眠）：
+	 *     connector_free_work（drm_connector_free_work_fn）执行：
+	 *       spin_lock_irqsave → llist_del_all → spin_unlock
+	 *       然后对每个 connector 调用 destroy()，完成真正的资源释放。
+	 *
+	 * ## 为什么用 llist_head 而非 list_head？
+	 *
+	 * llist（lock-less list）是无锁单向链表，llist_add() 使用 cmpxchg
+	 * 原子操作，**无需持有 spinlock 也能安全入队**。
+	 * 虽然此处入队时实际已持锁，但使用 llist 使 schedule_work 后的
+	 * 出队（llist_del_all）同样无锁，减少锁竞争。
 	 */
 	struct llist_head connector_free_list;
+
 	/**
-	 * @connector_free_work: Work to clean up @connector_free_list.
+	 * @connector_free_work: 执行 @connector_free_list 中 connector 延迟释放的工作项。
+	 *
+	 * 工作函数为 drm_connector_free_work_fn()：
+	 *   1. 持锁调用 llist_del_all() 原子摘走整个待释放队列
+	 *   2. 释放锁后逐一调用 connector->funcs->destroy()
+	 *   3. 调用 drm_mode_object_unregister() 注销 KMS 对象 ID
+	 *
+	 * 系统退出时 drm_mode_config_cleanup() 调用 flush_work() 等待
+	 * 所有延迟释放完成，确保无内存泄漏。
 	 */
 	struct work_struct connector_free_work;
 
@@ -518,11 +574,135 @@ struct drm_mode_config {
 	int max_width, max_height;
 	const struct drm_mode_config_funcs *funcs;
 	resource_size_t fb_base;
+    /* output poll support */
+	/*
+	 * 输出轮询（Output Poll）支持字段
+	 *
+	 * ## 背景：两种显示器热插拔检测方式
+	 *
+	 * 显示器插拔检测有两条路径，取决于硬件能力：
+	 *
+	 * 路径 1 — HPD 中断（DRM_CONNECTOR_POLL_HPD）：
+	 *   硬件具备专用的热插拔检测引脚（Hot Plug Detect），插拔时触发硬件中断，
+	 *   驱动在中断处理函数中调用 drm_kms_helper_hotplug_event() 立即通知上层。
+	 *   延迟极低（毫秒级），是 HDMI、DisplayPort 等接口的标准方式。
+	 *
+	 * 路径 2 — 软件轮询（DRM_CONNECTOR_POLL_CONNECT / POLL_DISCONNECT）：
+	 *   硬件没有专用 HPD 引脚，或驱动无法使用 HPD 中断，
+	 *   内核通过定时工作队列（delayed_work）周期性地主动探测 Connector 状态。
+	 *   VGA 接口是典型场景（无 HPD 引脚，需要主动读取 DDC 或检测电压）。
+	 *   轮询周期约 10 秒（DRM_OUTPUT_POLL_PERIOD），存在感知延迟。
+	 *
+	 * 下面四个字段共同管理路径 2 的软件轮询机制：
+	 *
+	 * ## 整体工作流程
+	 *
+	 *  drm_kms_helper_poll_init(dev)
+	 *      → 初始化 output_poll_work（执行函数：output_poll_execute）
+	 *      → poll_enabled = true
+	 *
+	 *  drm_kms_helper_poll_enable(dev)
+	 *      → 检查是否有 Connector 设置了 POLL_CONNECT 或 POLL_DISCONNECT
+	 *      → 若有，schedule_delayed_work(&output_poll_work, 10s)
+	 *
+	 *  output_poll_execute()  ← 每 10 秒在工作队列中执行一次
+	 *      → 遍历所有需要轮询的 Connector，调用 connector->funcs->detect()
+	 *      → 若状态变化（插入/拔出），设置 delayed_event = true，
+	 *        并立即 schedule_delayed_work(..., 0) 触发下一次执行
+	 *      → 下一次执行时读取 delayed_event，
+	 *        调用 drm_kms_helper_hotplug_event() 通知用户空间
+	 *      → 若还有需要轮询的 Connector，继续 schedule 下一轮（10s 后）
+	 *
+	 * ## 为什么状态变化后要"延迟一次"才通知用户空间？
+	 *
+	 * output_poll_execute() 在持有 mode_config.mutex 的情况下调用 detect()，
+	 * 而 fb helpers（用户空间响应热插拔时的回调）也需要获取同一把锁。
+	 * 为了避免死锁，状态变化后不在当前执行上下文中直接通知，
+	 * 而是设置 delayed_event = true，重新投递一次 work（delay = 0），
+	 * 在下一次执行（不持锁的情况下）再调用 drm_kms_helper_hotplug_event()。
+	 */
 
-	/* output poll support */
+	/**
+	 * @poll_enabled: 输出轮询机制的总开关。
+	 *
+	 * true  → 轮询机制已初始化，output_poll_work 可以被调度执行。
+	 *         由 drm_kms_helper_poll_init() 在驱动加载时设置为 true。
+	 *
+	 * false → 轮询机制未初始化或已被禁用（drm_kms_helper_poll_fini() 调用后）。
+	 *         output_poll_execute() 在函数入口检查此标志，为 false 则直接返回，
+	 *         防止设备关闭后 work 继续执行。
+	 *
+	 * 注意：此标志控制"轮询是否被初始化"，与 @poll_running 区分：
+	 * 即使 poll_enabled=true，若所有 Connector 都用 HPD 中断，
+	 * output_poll_work 也不会被调度（无需轮询）。
+	 */
 	bool poll_enabled;
+
+	/**
+	 * @poll_running: 上一次 output_poll_execute() 执行时全局轮询开关的状态。
+	 *
+	 * 记录上次工作队列执行时 drm_kms_helper_poll（全局开关模块参数）的值，
+	 * 用于检测全局开关是否在两次执行之间发生了变化：
+	 *
+	 *   if (drm_kms_helper_poll != poll_running)
+	 *       drm_kms_helper_poll_enable(dev);  // 全局开关状态变了，重新评估
+	 *   poll_running = drm_kms_helper_poll;   // 同步记录当前值
+	 *
+	 * 场景：用户通过 sysfs 将 drm_kms_helper_poll 从 0 改回 1 时，
+	 * 下一次 output_poll_execute() 执行会检测到此变化，重新启动轮询调度。
+	 * 反之，若全局开关被关闭，则停止调度。
+	 */
 	bool poll_running;
+
+	/**
+	 * @delayed_event: 待处理的热插拔事件标志（两阶段通知机制的中间状态）。
+	 *
+	 * ## 为什么需要两阶段通知？
+	 *
+	 * output_poll_execute() 检测到 Connector 状态变化后，不能立即调用
+	 * drm_kms_helper_hotplug_event()，因为：
+	 *   - hotplug_event 内部会调用 fb helpers
+	 *   - fb helpers 需要获取 mode_config.mutex
+	 *   - 而 output_poll_execute() 此时可能持有 mode_config.mutex
+	 *   - 直接调用会造成死锁
+	 *
+	 * ## 两阶段通知流程（触发场景：用户空间主动调用 probe）
+	 *
+	 * 第一阶段（在 drm_helper_probe_single_connector_modes() 持锁区内）：
+	 *   用户空间通过 ioctl 触发 probe，函数持有 mode_config.mutex，
+	 *   检测到 connector->status 变化后：
+	 *   → delayed_event = true          // 标记"有待处理事件"
+	 *   → schedule_delayed_work(..., 0) // 延迟 0，立即投递 output_poll_work
+	 *   此处不能直接调用 hotplug_event，因为 fb helpers 需要同一把锁，会死锁。
+	 *
+	 * 第二阶段（output_poll_execute() 在工作队列中执行，不持 mode_config.mutex）：
+	 *   changed = delayed_event         // 读取标志（此时已无锁）
+	 *   delayed_event = false           // 清除标志
+	 *   ...（继续尝试轮询其他 Connector）...
+	 *   if (changed) drm_kms_helper_hotplug_event(dev)  // 安全通知用户空间
+	 *
+	 * 注意：output_poll_execute() 自身检测到状态变化时（poll 路径），
+	 * 不需要走两阶段，直接在函数末尾的 out 标签处调用 hotplug_event，
+	 * 因为此时已通过 mutex_trylock 获取锁并在通知前主动释放了。
+	 */
 	bool delayed_event;
+
+	/**
+	 * @output_poll_work: 输出状态轮询的延迟工作队列项。
+	 *
+	 * 执行函数：output_poll_execute()（drm_probe_helper.c）
+	 *
+	 * 调度时机：
+	 *   - drm_kms_helper_poll_enable()：首次启动，延迟 10s（DRM_OUTPUT_POLL_PERIOD）
+	 *     若存在 delayed_event，则使用 1s 延迟（避免 Optimus/nouveau 的兼容问题）
+	 *   - drm_helper_probe_single_connector_modes()：用户空间主动探测时检测到状态变化，
+	 *     设置 delayed_event=true 后延迟 0 立即投递，让 hotplug_event 在无锁上下文执行
+	 *   - output_poll_execute() 内部：还有 Connector 需要继续轮询，延迟 10s 投递
+	 *
+	 * 取消时机：
+	 *   - drm_kms_helper_poll_disable()：cancel_delayed_work_sync() 同步取消
+	 *   - drm_kms_helper_poll_fini()：彻底停止，poll_enabled = false 后取消
+	 */
 	struct delayed_work output_poll_work;
 
 	/**
@@ -875,6 +1055,13 @@ struct drm_mode_config {
 	 */
 	struct drm_atomic_state *suspend_state;
 
+	/**
+	 * @helper_private: 原子提交的"尾部执行"钩子。
+	 *
+	 * 这是挂载在 drm_mode_config.helper_private 上的全局辅助函数表，
+	 * 提供设备级别（而非单个 CRTC/Plane/Connector 级别）的原子提交定制点。
+	 * 目前只有一个回调：@atomic_commit_tail，是整个原子提交流程的核心执行入口。
+	 */
 	const struct drm_mode_config_helper_funcs *helper_private;
 };
 

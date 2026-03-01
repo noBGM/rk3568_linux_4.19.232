@@ -1217,45 +1217,105 @@ static inline void drm_plane_helper_add(struct drm_plane *plane,
 }
 
 /**
- * struct drm_mode_config_helper_funcs - global modeset helper operations
+ * struct drm_mode_config_helper_funcs - 设备级模式设置辅助回调表
  *
- * These helper functions are used by the atomic helpers.
+ * 这是挂载在 drm_mode_config.helper_private 上的全局辅助函数表，
+ * 提供设备级别（而非单个 CRTC/Plane/Connector 级别）的原子提交定制点。
+ * 目前只有一个回调：@atomic_commit_tail，是整个原子提交流程的核心执行入口。
  */
 struct drm_mode_config_helper_funcs {
 	/**
-	 * @atomic_commit_tail:
+	 * @atomic_commit_tail: 原子提交的"尾部执行"钩子。
 	 *
-	 * This hook is used by the default atomic_commit() hook implemented in
-	 * drm_atomic_helper_commit() together with the nonblocking commit
-	 * helpers (see drm_atomic_helper_setup_commit() for a starting point)
-	 * to implement blocking and nonblocking commits easily. It is not used
-	 * by the atomic helpers
+	 * ## 在整个原子提交流程中的位置
 	 *
-	 * This function is called when the new atomic state has already been
-	 * swapped into the various state pointers. The passed in state
-	 * therefore contains copies of the old/previous state. This hook should
-	 * commit the new state into hardware. Note that the helpers have
-	 * already waited for preceeding atomic commits and fences, but drivers
-	 * can add more waiting calls at the start of their implementation, e.g.
-	 * to wait for driver-internal request for implicit syncing, before
-	 * starting to commit the update to the hardware.
+	 * 原子提交分为两个阶段：
 	 *
-	 * After the atomic update is committed to the hardware this hook needs
-	 * to call drm_atomic_helper_commit_hw_done(). Then wait for the upate
-	 * to be executed by the hardware, for example using
-	 * drm_atomic_helper_wait_for_vblanks() or
-	 * drm_atomic_helper_wait_for_flip_done(), and then clean up the old
-	 * framebuffers using drm_atomic_helper_cleanup_planes().
+	 * 阶段 1 — "头部"（atomic_commit 前半段，由 DRM 核心执行）：
+	 *   drm_atomic_helper_commit()
+	 *     ├─ drm_atomic_helper_prepare_planes()   // 准备帧缓冲（pin 内存、fence 等）
+	 *     ├─ drm_atomic_helper_swap_state()        // ★ 新旧状态指针原子交换
+	 *     └─ 投递 commit_work 到工作队列（非阻塞）或直接调用 tail（阻塞）
 	 *
-	 * When disabling a CRTC this hook _must_ stall for the commit to
-	 * complete. Vblank waits don't work on disabled CRTC, hence the core
-	 * can't take care of this. And it also can't rely on the vblank event,
-	 * since that can be signalled already when the screen shows black,
-	 * which can happen much earlier than the last hardware access needed to
-	 * shut off the display pipeline completely.
+	 * 阶段 2 — "尾部"（本钩子负责的部分）：
+	 *   atomic_commit_tail(state)
+	 *     ├─ [可选] 等待额外的驱动内部同步
+	 *     ├─ 将新状态写入硬件寄存器（modeset / plane update）
+	 *     ├─ drm_atomic_helper_commit_hw_done()   // 通知核心"硬件已接受指令"
+	 *     ├─ 等待硬件真正完成（等 VBlank / flip done）
+	 *     └─ drm_atomic_helper_cleanup_planes()   // 释放旧帧缓冲
 	 *
-	 * This hook is optional, the default implementation is
-	 * drm_atomic_helper_commit_tail().
+	 * ## 调用时机：状态已交换完毕
+	 *
+	 * 本钩子被调用时，drm_atomic_helper_swap_state() 已经执行完毕：
+	 *   - 各 CRTC/Plane/Connector 对象的 state 指针已经指向**新状态**
+	 *   - 传入的 @state 参数里保存的是**旧状态**的拷贝
+	 *
+	 * 因此驱动在此处写硬件寄存器时，直接读取对象当前的 state 字段即可获得
+	 * 新的目标配置；而 @state 参数中的旧状态则用于差量对比和资源清理。
+	 *
+	 * ## 进入本钩子前，DRM 核心已完成的等待
+	 *
+	 * 驱动无需重复处理以下同步：
+	 *   1. 等待本次提交之前**所有前序原子提交**完成
+	 *      （drm_atomic_helper_wait_for_dependencies() 已处理）
+	 *   2. 等待帧缓冲关联的**显式 in-fence**（GPU 渲染完成的 dma_fence）到位
+	 *      （drm_atomic_helper_wait_for_fences() 已处理）
+	 *
+	 * 但驱动可以在本钩子**开头**添加自己的等待，例如：
+	 *   - 等待驱动内部的隐式同步请求（implicit sync）
+	 *   - 等待上一次 CRTC 关闭序列完全结束才开始新的上电序列
+	 *   - 等待硬件特定的就绪信号（如 VOP2 的 overlay 合成器 idle 状态）
+	 *
+	 * ## 写入硬件后的必要步骤（顺序不可颠倒）
+	 *
+	 * Step 1：调用 drm_atomic_helper_commit_hw_done()
+	 *   通知 DRM 核心"硬件已接收到新配置指令"。
+	 *   此调用会触发：
+	 *     - drm_crtc_commit.hw_done completion → 解除下一次提交的依赖等待
+	 *     - fake_commit 的 completion → 释放游离 Plane/Connector 的状态锁
+	 *   注意：此时硬件可能还未真正执行（仍在等下一个 VBlank），
+	 *   但"指令已入队"这个事实已经可以通知上层。
+	 *
+	 * Step 2：等待硬件实际执行完成，二选一：
+	 *   - drm_atomic_helper_wait_for_vblanks()
+	 *       等待所有被修改的 CRTC 各经历一次 VBlank，确认新帧已上屏。
+	 *       适用于普通 page flip 和 Plane 更新场景。
+	 *   - drm_atomic_helper_wait_for_flip_done()
+	 *       等待 drm_crtc_commit.flip_done completion，
+	 *       由 drm_crtc_send_vblank_event() 在 VBlank 中断里触发。
+	 *       适用于需要精确感知 page flip 完成时刻的场景。
+	 *
+	 * Step 3：调用 drm_atomic_helper_cleanup_planes()
+	 *   确认新帧已上屏后，释放旧帧缓冲的引用（drm_framebuffer_put），
+	 *   unpin 旧帧缓冲占用的显存（通过 plane_helper_funcs.cleanup_fb）。
+	 *   必须在等待 VBlank 之后调用，否则硬件可能仍在扫描旧帧缓冲而导致 tearing。
+	 *
+	 * ## 关闭 CRTC 时的特殊要求（阻塞等待，不可省略）
+	 *
+	 * 当本次提交包含 CRTC 关闭（active = false → modeset disable 序列）时，
+	 * 本钩子**必须阻塞等待**整个关闭序列完全执行完毕，原因有二：
+	 *
+	 * 原因 1：CRTC 关闭后 VBlank 中断停止，DRM 核心无法用 VBlank 等待来判断完成。
+	 *   CRTC 处于 disabled 状态时，drm_wait_one_vblank() 会立即超时返回，
+	 *   核心无法依赖 VBlank 机制来感知关闭进度。
+	 *
+	 * 原因 2：VBlank event 不能作为"显示管道完全停止"的标志。
+	 *   VBlank event 可能在屏幕变黑时就已触发（信号已传递给用户空间），
+	 *   但此时显示管道的最后几个硬件寄存器写操作（如 DSI 链路断开、
+	 *   PHY 断电、PLL 停振）可能远未完成。
+	 *   若此时允许下一次提交开始（如重新上电），会导致硬件时序冲突。
+	 *
+	 * 因此驱动在关闭 CRTC 时，必须通过轮询状态寄存器或等待硬件专用完成信号
+	 * 来确保管道完全停止，而不能依赖通用的 VBlank 等待路径。
+	 *
+	 * ## 默认实现
+	 *
+	 * 本钩子可选，若驱动不实现，DRM 核心使用默认实现：
+	 *   drm_atomic_helper_commit_tail()
+	 * 该默认实现按照上述标准流程执行，适合大多数简单驱动。
+	 * 只有当驱动需要在标准流程前后插入自定义逻辑时，才需要覆盖本钩子
+	 * （如 Rockchip VOP2 在写寄存器前需要等待 overlay 合成器进入 idle 状态）。
 	 */
 	void (*atomic_commit_tail)(struct drm_atomic_state *state);
 };
