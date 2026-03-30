@@ -154,6 +154,7 @@ struct rockchip_crtc_state {
 	u8 mode_update;
 	struct rockchip_hdr_state hdr;
 };
+//VOP CRTC state = vcstate，表示这是 VOP2 驱动私有的 CRTC 状态结构体实例。
 #define to_rockchip_crtc_state(s) \
 		container_of(s, struct rockchip_crtc_state, base)
 

@@ -220,6 +220,116 @@ struct drm_prime_callback_data {
 };
 #endif
 
+/*
+ * ============================================================
+ * Loader Logo 无缝衔接机制
+ * ============================================================
+ *
+ * 【存在的目的】
+ *
+ * 解决一个体验问题：从按下电源键到看到 UI 界面，中间有一段"内核初始化时间"。
+ * 如果什么都不做，这段时间屏幕会黑屏（uboot 结束后 VOP 停止扫描），
+ * 体验极差。
+ *
+ * 这套机制的目标：让屏幕从 uboot 的 logo 画面，无缝过渡到合成器的第一帧，
+ * 全程不出现黑屏。
+ *
+ * 【为什么用 #ifndef MODULE】
+ *
+ * MODULE 宏由构建系统自动定义：Kconfig 中选 =y（编进内核）时不定义，
+ * 选 =m（编为 .ko 模块）时自动在编译命令中加 -DMODULE。
+ *
+ * 整套机制有一个硬性前提：驱动必须在内核启动阶段（initcall）就位，
+ * 而不是之后由用户空间 modprobe 加载。
+ *
+ * built-in 驱动（=y，#ifndef MODULE 生效，量产手机/平板/嵌入式）：
+ *   内核启动期间 module_init 运行 → 此时 uboot 写的像素还在保留内存里
+ *   → 有效，可以接管 → 全程无黑屏
+ *
+ *   uboot logo ─────────────────────────────▶ 合成器第一帧
+ *               [屏幕持续亮着，全程无黑屏]
+ *
+ * 可加载模块（=m，MODULE 被定义，这段代码整体消失，桌面 Linux 发行版）：
+ *   modprobe 在用户空间启动后才运行 → 距 uboot 已过数秒
+ *   → uboot 保留内存可能已被覆盖，FDT 属性可能已失效，接管无意义
+ *   → 中间必然出现黑屏，桌面系统用 Plymouth 等开机动画框架另行掩盖
+ *
+ *   uboot logo ──▶ 黑屏 ──▶ 内核跑完 ──▶ modprobe ──▶ 合成器第一帧
+ *                  [这段黑屏无法避免]
+ *
+ * 注意：uboot 显示 logo 本身与 =y/=m 无关，uboot 自己完成。
+ * #ifndef MODULE 控制的只是"内核能否无缝接管 uboot 已显示的 logo"，
+ * 即消灭上图中间那段黑屏。
+ *
+ * 【核心设计逻辑：三方接力】
+ *
+ *   第一棒：uboot
+ *     ① 读 DTS route 节点的 logo,uboot = "logo.bmp"，加载并解码 BMP
+ *     ② 将像素数据写入 drm-logo 保留内存（这块内存内核不会动它）
+ *     ③ 将图像元数据回填进 FDT（动态写入，源码里看不到）：
+ *          logo,offset / logo,width / logo,height / logo,bpp
+ *     ④ 将 video,clock / video,hdisplay / video,vdisplay 等时序参数
+ *        也回填进 FDT（uboot 知道当前屏幕在以哪种分辨率/刷新率显示）
+ *     ⑤ 让 VOP 按当前时序扫描 drm-logo 保留内存 → 屏幕显示 logo
+ *
+ *   间歇期：内核启动（屏幕靠 uboot 设好的寄存器状态持续扫描）
+ *     rockchip_clocks_loader_protect()（arch_initcall_sync，极早期运行）：
+ *       对 aclk_vop / dclk_vop 等一系列时钟执行 clk_prepare_enable，
+ *       使它们的引用计数 +1，防止内核时钟管理在驱动初始化前把它们关掉，
+ *       从而保证 VOP 硬件持续工作，屏幕不黑。
+ *
+ *   第二棒：内核 DRM 驱动（show_loader_logo，在 rockchip_drm_bind 中调用）
+ *     ① init_loader_memory()：
+ *          从 DTS memory-region["drm-logo"] 找到保留内存的物理地址和大小，
+ *          若启用了 IOMMU 则建立 1:1 物理地址→IOVA 映射（让 VOP DMA 能访问），
+ *          把这块内存的元信息存入 private->logo。
+ *     ② 遍历 route 子节点（只处理 status = "okay" 的）：
+ *          of_parse_display_resource()：
+ *            - 读 connect 属性 → 找到对应的 drm_crtc 和 drm_connector
+ *            - get_framebuffer_by_node()：
+ *                读 FDT 中 uboot 回填的 logo,offset/width/height/bpp，
+ *                将保留内存包装成 drm_framebuffer
+ *            - 读 video,clock/hdisplay/vdisplay/vrefresh 等时序参数
+ *              （uboot 回填的，代表当前屏幕实际运行的时序）
+ *          setup_initial_state()：
+ *            - 调用 connector 的 get_modes()，获取屏幕支持的模式列表
+ *            - 找到与 uboot 当前时序完全匹配的 drm_display_mode
+ *            - 将 CRTC/connector/plane 状态设置为"已激活"
+ *            - 启用 loader_protect 标志，阻止驱动重新初始化硬件
+ *              （关键：此时硬件已在工作，不能重置，否则会闪屏）
+ *     ③ drm_atomic_helper_swap_state()：
+ *          将上述构造的状态作为 old_state 注入 DRM 状态机，
+ *          让 DRM 框架"认为"这是当前硬件已有的状态——
+ *          这样合成器来的第一次原子提交只会做增量更新，
+ *          不会触发全量的 modeset（重新配时序），避免闪屏。
+ *     ④ drm_atomic_commit()：
+ *          提交一次原子操作，正式让 DRM 框架接管 VOP 对保留内存的扫描，
+ *          此后合成器可以在任意 VBlank 切换 framebuffer。
+ *     ⑤ rockchip_free_loader_memory()：
+ *          IOMMU unmap + 释放保留内存 → 内核可以将这块内存归还给内存管理器。
+ *          （在合成器第一帧提交后才真正调用，确保切换完成后再释放）
+ *
+ *   间歇期结束：
+ *     rockchip_clocks_loader_unprotect()（late_initcall_sync）：
+ *       对之前保护的时钟执行 clk_disable_unprepare，
+ *       撤销 loader_protect 阶段的引用计数 +1，
+ *       将时钟控制权完全交还给正常的时钟管理框架。
+ *
+ *   第三棒：合成器（weston / SurfaceFlinger）
+ *     open /dev/dri/card0 → 探测 connector → 分配新 framebuffer
+ *     → 原子提交第一帧 → VOP 切换到新 framebuffer → 屏幕显示 UI
+ *     整个过程因为 old_state 的存在，DRM 框架知道"不需要重新 modeset"，
+ *     VOP 输出时序全程不中断，用户看不到任何黑屏或闪烁。
+ *
+ * 【loader_protect 标志的作用】
+ *
+ * setup_initial_state() 会对 connector/encoder/crtc 设置 loader_protect = true。
+ * 这个标志告诉各子驱动的 enable/disable 回调：
+ * "硬件现在已经在工作，你不要重新初始化（不要发 DSI 初始化序列、不要重新上电）"
+ * 直到合成器第一次真正做 modeset 时，loader_protect 才被清除，
+ * 驱动才开始正常的 enable/disable 流程。
+ * ============================================================
+ */
 #ifndef MODULE
 static struct drm_crtc *find_crtc_by_node(struct drm_device *drm_dev, struct device_node *node)
 {
@@ -1281,6 +1391,51 @@ void rockchip_unregister_crtc_funcs(struct drm_crtc *crtc)
 	priv->crtc_funcs[pipe] = NULL;
 }
 
+/**
+ * rockchip_drm_fault_handler - IOMMU page fault 回调，用于事后诊断
+ * @iommu: 触发 fault 的 IOMMU domain
+ * @dev:   触发 fault 的主设备（此处为 VOP2 的 platform_device）
+ * @iova:  触发 fault 的虚拟地址（IOVA，即 DMA 地址）
+ * @flags: fault 类型掩码，来自 <linux/iommu.h>：
+ *           IOMMU_FAULT_READ        (bit0) VOP2 读取时触发（扫帧 DMA 最常见）
+ *           IOMMU_FAULT_WRITE       (bit1) VOP2 写入时触发（Writeback 场景）
+ *           IOMMU_FAULT_TRANSLATION (bit2) IOVA 未建立页表映射（最典型：buffer 已 unmap）
+ *           IOMMU_FAULT_PERMISSION  (bit3) 页表存在但权限不足（如只读页被写）
+ *           IOMMU_FAULT_EXTERNAL    (bit4) 外部硬件总线错误（非正常页表 miss）
+ *           IOMMU_FAULT_TRANSACTION_STALLED (bit5) 事务被 IOMMU 挂起等待处理
+ * @arg:   注册时传入的私有数据，即 drm_device 指针
+ *
+ * ## 触发时机
+ *
+ * VOP2 通过 AXI 总线向 IOMMU 发起 DMA 读请求（取帧缓冲像素数据），
+ * IOMMU 在 page table walk 中发现该 IOVA 没有有效映射，
+ * 硬件产生 fault 中断，驱动层注册的此函数被调用。
+ *
+ * 常见触发根因（结合 flags 分析）：
+ *
+ *   ① TRANSLATION fault（最频繁）：
+ *      GEM buffer 的 IOVA 已通过 iommu_unmap() 删除，但 VOP2 的扫描地址寄存器
+ *      还没更新到新帧（等待下一个 VBlank 锁存），导致硬件访问已失效的 IOVA。
+ *      典型场景：disable CRTC 流程与 VOP2 硬件 DMA 之间的竞态窗口。
+ *
+ *   ② PERMISSION fault：
+ *      IOVA 映射存在，但映射时指定了只读（IOMMU_READ），而 VOP2 Writeback 路径
+ *      尝试写入，驱动设置权限有误。
+ *
+ *   ③ EXTERNAL fault：
+ *      AXI 总线错误（如 NoC 超时、电源域未打开时强行访问），与页表无关。
+ *
+ * ## 此函数的设计定位：诊断，不恢复
+ *
+ * 返回 0 表示"已处理"（让内核继续运行，不 panic），但实际上
+ * VOP2 已经读到了无效数据，当前帧的显示输出可能出现：
+ *   - 花屏（随机数据被当像素渲染）
+ *   - 黑屏（显示流水线停止响应）
+ *   - VOP2 内部状态机卡死（需要完整 reset 才能恢复）
+ *
+ * 因此此函数的主要价值是在 fault 发生后**留下尽可能详细的现场快照**，
+ * 供开发者事后分析，定位 unmap/scan 时序问题或驱动 bug。【笔记钩子】
+ */
 static int rockchip_drm_fault_handler(struct iommu_domain *iommu,
 				      struct device *dev,
 				      unsigned long iova, int flags, void *arg)
@@ -1289,35 +1444,148 @@ static int rockchip_drm_fault_handler(struct iommu_domain *iommu,
 	struct rockchip_drm_private *priv = drm_dev->dev_private;
 	struct drm_crtc *crtc;
 
+	/* 打印故障基本信息：flags 十六进制值可与上方 IOMMU_FAULT_* 宏对照分析 */
 	DRM_ERROR("iommu fault handler flags: 0x%x\n", flags);
+
+	/*
+	 * 遍历所有 CRTC（对应 VOP2 的每个 Video Port），转储其硬件状态。
+	 *
+	 * 之所以转储所有 CRTC 而非仅 fault 的那个，是因为：
+	 * VOP2 多个 VP 共享同一个 IOMMU domain，任一 VP 的 DMA 故障
+	 * 都可能影响其他 VP 的状态，需要完整快照才能还原现场。
+	 */
 	drm_for_each_crtc(crtc, drm_dev) {
+		/*
+		 * drm_crtc_index() 返回 CRTC 在 drm_device 中的全局序号（0 起）,
+		 * 对应 priv->crtc_funcs[] 数组的下标，最大为 ROCKCHIP_MAX_CRTC-1。
+		 * crtc_funcs 由 vop2_bind() 通过 rockchip_register_crtc_funcs()
+		 * 在 CRTC 注册时填入，若该 CRTC 尚未注册或已注销则为 NULL。
+		 */
 		int pipe = drm_crtc_index(crtc);
 
+		/*
+		 * regs_dump：转储 VOP2 Video Port 的**硬件寄存器**原始值。
+		 *
+		 * 对应 vop2_crtc_regs_dump()，输出内容包括：
+		 *   - WIN 图层的帧缓冲地址寄存器（YRGB_MST / CBR_MST）← fault IOVA 的直接来源
+		 *   - 显示时序寄存器（HTOTAL / VTOTAL / HSYNC / VSYNC）
+		 *   - 颜色空间、格式、缩放等控制寄存器
+		 *
+		 * seq_file 传 NULL 表示直接通过 DRM_ERROR/pr_err 输出到内核日志，
+		 * 而非写入 debugfs 文件（debugfs 路径下 seq_file 非 NULL）。
+		 */
 		if (priv->crtc_funcs[pipe] &&
 		    priv->crtc_funcs[pipe]->regs_dump)
 			priv->crtc_funcs[pipe]->regs_dump(crtc, NULL);
 
+		/*
+		 * debugfs_dump：转储更高层的**软件状态**信息。
+		 *
+		 * 对应 vop2_crtc_debugfs_dump()，输出内容包括：
+		 *   - 当前 drm_plane_state 中的 GEM buffer 信息（fb、IOVA 等）
+		 *   - atomic commit 状态、flip pending 标志
+		 *   - 带宽统计、颜色空间、HDR 状态等
+		 *
+		 * 与 regs_dump 配合使用：
+		 *   regs_dump 反映"硬件实际在用什么"，
+		 *   debugfs_dump 反映"软件认为硬件应该在用什么"，
+		 *   两者不一致时往往就是 bug 所在。
+		 */
 		if (priv->crtc_funcs[pipe] &&
 		    priv->crtc_funcs[pipe]->debugfs_dump)
 			priv->crtc_funcs[pipe]->debugfs_dump(crtc, NULL);
 	}
 
+	/*
+	 * 返回 0：告知 IOMMU 框架"fault 已处理，继续运行"。
+	 * 硬件层面 VOP2 此次 DMA 事务已经失败，当前帧输出可能异常，
+	 * 但内核不会因此 panic，后续新的 atomic commit 可能会恢复正常。
+	 */
 	return 0;
 }
 
+/**
+ * rockchip_drm_init_iommu - 初始化 DRM 设备的 IOMMU 映射域和虚拟地址分配器
+ * @drm_dev: Rockchip DRM 设备
+ *
+ * 返回值：0 成功；-ENOMEM 分配 IOMMU domain 失败
+ *
+ * ## 背景：为什么 DRM 需要 IOMMU？
+ *
+ * VOP2（显示控制器）作为 DMA master，从 DDR 读取帧缓冲数据时，
+ * 其 DMA 地址默认是**物理地址**，要求帧缓冲必须物理连续（CMA 内存）。
+ *
+ * 引入 IOMMU 后，VOP2 的 DMA 使用的是 **IOVA（I/O 虚拟地址）**，
+ * 由 IOMMU MMU 硬件将 IOVA → 物理页面的映射，
+ * 帧缓冲无需物理连续，普通的离散页即可，极大减少对 CMA 内存的依赖。
+ *
+ * ## 整体 IOMMU 使用流程
+ *
+ *  本函数：iommu_domain_alloc() → 创建共享 IOMMU domain
+ *         drm_mm_init()        → 初始化 IOVA 虚拟地址分配器
+ *
+ *  VOP2 bind 时：rockchip_drm_dma_attach_device()
+ *         iommu_attach_device(domain, vop_dev) → 将 VOP2 挂入 domain，
+ *         此后 VOP2 的所有 DMA 事务均经过此 domain 的 MMU 翻译
+ *
+ *  GEM buffer 分配时：rockchip_gem_create()
+ *         drm_mm_insert_node() → 从 private->mm 分配一段 IOVA
+ *         iommu_map()          → 建立 IOVA → 物理页的映射（填充页表）
+ *         VOP2 的 DMA 地址寄存器写入该 IOVA 即可
+ *
+ *  GEM buffer 释放时：
+ *         iommu_unmap()        → 拆除 IOVA → 物理页的映射
+ *         drm_mm_remove_node() → 归还 IOVA 段
+ *
+ * ## 本函数的三步初始化
+ */
 static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
 {
 	struct rockchip_drm_private *private = drm_dev->dev_private;
 	struct iommu_domain_geometry *geometry;
 	u64 start, end;
 
+	/*
+	 * is_support_iommu = false（由 rockchip_drm_platform_of_probe 设置）
+	 * 说明至少有一个 VOP 没有 IOMMU 支持，全系统退回物理连续内存模式，
+	 * 无需创建 IOMMU domain，直接返回。
+	 */
 	if (!is_support_iommu)
 		return 0;
 
+	/*
+	 * 步骤 1：为 platform_bus 类型的设备分配一个共享 IOMMU domain。
+	 *
+	 * iommu_domain_alloc(&platform_bus_type) 创建一个"空白"地址空间域，
+	 * 内部分配页表（通常是 4KB 粒度的二/三级页表），
+	 * 并由 IOMMU 驱动（如 Rockchip IOMMU 驱动）初始化域的属性，
+	 * 包括 geometry（地址孔径）和页表格式（ARMv8 Short-descriptor 等）。
+	 *
+	 * 所有 VOP2 的 VP（CRTC）共享同一个 domain，意味着：
+	 *   - 它们使用同一套 IOVA 地址空间（不会重叠，由 drm_mm 统一分配）
+	 *   - 同一块 GEM buffer 可以被多个 CRTC 同时扫描，无需重复映射
+	 */
 	private->domain = iommu_domain_alloc(&platform_bus_type);
 	if (!private->domain)
 		return -ENOMEM;
 
+	/*
+	 * 步骤 2：读取 IOMMU domain 的地址孔径（aperture），初始化 drm_mm。
+	 *
+	 * geometry->aperture_start / aperture_end 是此 domain 允许映射的
+	 * IOVA 地址范围，由 IOMMU 硬件/驱动决定：
+	 *   Rockchip IOMMU 通常为 0x10000000 ~ 0xFFFFFFFF（约 3.75GB IOVA 空间）
+	 *
+	 * drm_mm 是 DRM 内置的区间分配器（类似 malloc 的地址空间管理），
+	 * 以 aperture 范围初始化后，负责从该范围内分配和回收 IOVA 段：
+	 *   drm_mm_insert_node(mm, node, size) → 分配一段连续的 IOVA
+	 *   drm_mm_remove_node(node)           → 归还该 IOVA 段
+	 *
+	 * mm_lock 保护 drm_mm 的并发访问（多个线程可能同时分配/释放 GEM buffer）。
+	 *
+	 * 可通过 debugfs 查看当前 IOVA 分配状态：【笔记钩子】
+	 *   cat /sys/kernel/debug/dri/0/mm_dump
+	 */
 	geometry = &private->domain->geometry;
 	start = geometry->aperture_start;
 	end = geometry->aperture_end;
@@ -1327,6 +1595,24 @@ static int rockchip_drm_init_iommu(struct drm_device *drm_dev)
 	drm_mm_init(&private->mm, start, end - start + 1);
 	mutex_init(&private->mm_lock);
 
+	/*
+	 * 步骤 3：注册 IOMMU 缺页故障处理函数。
+	 *
+	 * 当 VOP2 的 DMA 访问了 domain 中**未建立映射**的 IOVA 时，
+	 * IOMMU 硬件触发 page fault，调用此回调 rockchip_drm_fault_handler()。
+	 *
+	 * fault handler 的处理逻辑：
+	 *   1. 打印错误日志（包含故障 flags：READ/WRITE/EXTERNAL 等）
+	 *   2. 遍历所有 CRTC，调用各 CRTC 的 regs_dump()（转储 VOP 寄存器状态）
+	 *      和 debugfs_dump()（转储更详细的显示状态信息）
+	 *   3. 返回 0（不杀进程，让内核继续）
+	 *
+	 * 常见触发原因：
+	 *   - GEM buffer 已 unmap 但 VOP2 寄存器尚未更新（时序问题）
+	 *   - DRM 驱动 bug 导致写入了无效的帧缓冲地址
+	 *   - 热插拔 disable CRTC 期间，GEM buffer IOVA 被提前 unmap，
+	 *     而 VOP2 硬件 DMA 尚未完全停止，导致访问已失效的 IOVA
+	 */
 	iommu_set_fault_handler(private->domain, rockchip_drm_fault_handler,
 				drm_dev);
 
@@ -1641,6 +1927,33 @@ static bool is_support_hotplug(uint32_t output_type)
 	}
 }
 
+/**
+ * rockchip_drm_bind - Rockchip DRM 显示子系统的聚合绑定入口
+ * @dev: display-subsystem platform_device.dev
+ *
+ * 本函数是 component 框架调用的 master .bind() 回调，
+ * 在所有子组件（VOP2、DSI、HDMI 等）都通过 component_add() 注册后触发。
+ * 完成整个 DRM 设备的完整初始化，最终向用户空间开放 /dev/dri/card0。
+ *
+ * ## 初始化阶段总览
+ *
+ *  阶段 1：创建 drm_device 骨架
+ *  阶段 2：初始化 Rockchip 私有数据（锁、devfreq、PLL、PSR）
+ *  阶段 3：初始化 IOMMU 内存映射域
+ *  阶段 4：初始化 KMS 模式配置框架（mode_config）
+ *  阶段 5：绑定所有子组件（注册 CRTC/Encoder/Connector/Plane）
+ *  阶段 6：初始化 VBlank、属性默认值、中断模式
+ *  阶段 7：初始化热插拔轮询、GEM 内存池、Loader logo、fbdev 兼容层
+ *  阶段 8：向用户空间注册 DRM 设备
+ *
+ * ## 错误回滚路径（goto 标签，逆序释放）
+ *
+ *  err_fbdev_fini         → 释放 fbdev
+ *  err_kms_helper_poll_fini → 释放 GEM 池 + 停止 KMS poll
+ *  err_unbind_all         → 解绑所有子组件
+ *  err_mode_config_cleanup→ 清理 mode_config + IOMMU
+ *  err_free               → 清理 drm_dev
+ */
 static int rockchip_drm_bind(struct device *dev)
 {
 	struct drm_device *drm_dev;
@@ -1650,23 +1963,64 @@ static int rockchip_drm_bind(struct device *dev)
 	struct device_node *parent_np;
 	struct drm_crtc *crtc;
 
+	/* ================================================================
+	 * 阶段 1：创建 drm_device 骨架
+	 * ================================================================ */
+
+	/*
+	 * 分配并初始化 drm_device，绑定 rockchip_drm_driver 操作集。
+	 * drm_device 是整个 DRM 子系统的顶层容器，持有 mode_config、
+	 * filelist、vblank 等所有核心状态。
+	 */
 	drm_dev = drm_dev_alloc(&rockchip_drm_driver, dev);
 	if (IS_ERR(drm_dev))
 		return PTR_ERR(drm_dev);
 
+	/* 将 drm_dev 存入平台设备的 drvdata，方便后续通过 dev 反查 */
 	dev_set_drvdata(dev, drm_dev);
 
+	/* ================================================================
+	 * 阶段 2：初始化 Rockchip 私有数据
+	 * ================================================================ */
+
+	/*
+	 * 分配 rockchip_drm_private，使用 devm_kzalloc 绑定到 drm_dev->dev，
+	 * 设备卸载时自动释放，无需手动 kfree。
+	 */
 	private = devm_kzalloc(drm_dev->dev, sizeof(*private), GFP_KERNEL);
 	if (!private) {
 		ret = -ENOMEM;
 		goto err_free;
 	}
 
+	/*
+	 * 初始化两把互斥锁和一个异步提交工作队列：
+	 *   commit_lock：保护 rockchip_atomic_commit 对象，序列化异步原子提交
+	 *   ovl_lock：保护 VOP2 共享 overlay 资源（OVL_LAYER_SEL/OVL_PORT_SEL 寄存器），
+	 *             多个 VP 可能竞争同一组全局 overlay 路由寄存器
+	 *   commit_work：非阻塞原子提交的工作队列执行体，在 kthread_worker 中
+	 *               异步等待 VBlank 并写硬件寄存器，允许合成器立即返回渲染下一帧
+	 */
 	mutex_init(&private->commit_lock);
 	mutex_init(&private->ovl_lock);
 	INIT_WORK(&private->commit_work, rockchip_drm_atomic_work);
 	drm_dev->dev_private = private;
 
+	/*
+	 * 初始化 DMC（Dynamic Memory Controller）动态内存频率调节支持。
+	 *
+	 * devfreq_get_devfreq_by_phandle() 通过 DTS 的 "devfreq" 属性获取
+	 * DMC 的 devfreq 设备（动态频率调节框架的句柄）。
+	 * DMC 频率调节可以在显示刷新间隙降低 DDR 频率以节省功耗。
+	 *
+	 * 三种结果：
+	 *   成功获取：dmc_support = true，后续可动态调节 DDR 频率
+	 *   -EPROBE_DEFER（DMC 驱动尚未就绪）：
+	 *     若 DTS 中 devfreq 节点存在且可用 → dmc_support = true，
+	 *       但 devfreq 指针置 NULL（等待重试）
+	 *     若 DTS 中 devfreq 节点不存在或已禁用 → dmc_support = false
+	 *   其他错误（节点不存在等）：devfreq = NULL，dmc_support = false
+	 */
 	private->dmc_support = false;
 	private->devfreq = devfreq_get_devfreq_by_phandle(dev, 0);
 	if (IS_ERR(private->devfreq)) {
@@ -1687,6 +2041,18 @@ static int rockchip_drm_bind(struct device *dev)
 		private->dmc_support = true;
 		dev_info(dev, "devfreq is ready\n");
 	}
+
+	/*
+	 * 获取 HDMI TMDS PLL 时钟句柄（可选）。
+	 *
+	 * HDMI 输出需要精确的 TMDS 时钟（148.5MHz@1080p60 等），
+	 * 由独立的 HDMI PLL 提供。VOP2 输出 HDMI 时通过此 PLL 获取像素时钟。
+	 *
+	 * -ENOENT：DTS 中未配置 "hdmi-tmds-pll"（如无 HDMI 输出的方案），
+	 *   置 NULL 表示不使用，继续初始化
+	 * -EPROBE_DEFER：PLL 驱动尚未就绪，整体推迟重试
+	 * 其他错误：硬件异常，直接失败
+	 */
 	private->hdmi_pll.pll = devm_clk_get(dev, "hdmi-tmds-pll");
 	if (PTR_ERR(private->hdmi_pll.pll) == -ENOENT) {
 		private->hdmi_pll.pll = NULL;
@@ -1698,6 +2064,14 @@ static int rockchip_drm_bind(struct device *dev)
 		ret = PTR_ERR(private->hdmi_pll.pll);
 		goto err_free;
 	}
+
+	/*
+	 * 获取默认 VOP PLL 时钟句柄（可选）。
+	 *
+	 * 当 HDMI PLL 不可用时（未接 HDMI 或 HDMI 已释放 PLL），
+	 * VOP2 使用此默认 PLL 为其他输出接口（DSI、eDP）提供像素时钟。
+	 * 同样为可选项，-ENOENT 表示硬件方案无此 PLL，置 NULL 跳过。
+	 */
 	private->default_pll.pll = devm_clk_get(dev, "default-vop-pll");
 	if (PTR_ERR(private->default_pll.pll) == -ENOENT) {
 		private->default_pll.pll = NULL;
@@ -1710,52 +2084,172 @@ static int rockchip_drm_bind(struct device *dev)
 		goto err_free;
 	}
 
+	/*
+	 * 初始化 PSR（Panel Self-Refresh）设备列表。
+	 * PSR 允许屏幕在画面静止时自行刷新（不需要 SoC 持续发送帧数据），
+	 * 大幅降低笔记本/平板等电池设备的显示功耗。
+	 * psr_list 挂载所有支持 PSR 的 connector，psr_list_lock 保护并发访问。
+	 */
 	INIT_LIST_HEAD(&private->psr_list);
 	mutex_init(&private->psr_list_lock);
 
+	/* ================================================================
+	 * 阶段 3：初始化 IOMMU 内存映射域
+	 * ================================================================ */
+
+	/*
+	 * 为 VOP2 创建并挂载 iommu_domain。
+	 * 若 is_support_iommu = true，VOP2 DMA 通过 IOMMU 使用虚拟地址，
+	 * GEM buffer 无需物理连续（节省 CMA 内存）；
+	 * 若 is_support_iommu = false，此函数为空操作，所有帧缓冲使用物理连续内存。
+	 */
 	ret = rockchip_drm_init_iommu(drm_dev);
 	if (ret)
 		goto err_free;
 
+	/* ================================================================
+	 * 阶段 4：初始化 KMS 模式配置框架
+	 * ================================================================ */
+
+	/*
+	 * drm_mode_config_init：初始化 drm_mode_config 结构体，
+	 * 包括 CRTC/Plane/Connector/Encoder 对象链表、全局互斥锁、
+	 * property_blob_list 等，是所有 KMS 对象注册的前提。
+	 */
 	drm_mode_config_init(drm_dev);
 
+	/*
+	 * rockchip_drm_mode_config_init：设置 Rockchip 特定的 mode_config 参数：
+	 *   min/max_width、min/max_height（支持的分辨率范围）
+	 *   funcs（.fb_create、.atomic_check、.atomic_commit 等回调）
+	 *   helper_private（.atomic_commit_tail 回调，即 atomic_commit_tail 钩子）
+	 */
 	rockchip_drm_mode_config_init(drm_dev);
+
+	/*
+	 * 创建 Rockchip 私有 DRM 属性（drm_property）：
+	 *   "CONNECTOR_ID"：标识 connector 的私有编号，供 Rockchip userspace 使用
+	 *   各种 Rockchip 扩展属性（色彩增强、scaling 策略等）
+	 * 这些属性在 component_bind_all() 之前创建，子组件 bind 时可直接附加。
+	 */
 	rockchip_drm_create_properties(drm_dev);
-	/* Try to bind all sub drivers. */
+
+	/* ================================================================
+	 * 阶段 5：绑定所有子组件（核心步骤）
+	 * ================================================================ */
+
+	/*
+	 * component_bind_all：遍历 master->match 列表，依次调用每个子组件的
+	 * ops->bind(comp_dev, master_dev, drm_dev)。
+	 *
+	 * 各子组件 bind 完成后：
+	 *   vop2_bind()         → 注册 drm_crtc（VP0/VP1/VP2）和 drm_plane（Win0~Win3）
+	 *   dw_mipi_dsi_bind()  → 注册 drm_encoder（DSI）和 drm_connector（DSI）
+	 *   dw_hdmi_bind()      → 注册 drm_encoder（TMDS）和 drm_connector（HDMI）
+	 *   rockchip_dp_bind()  → 注册 drm_encoder（eDP）和 drm_connector（eDP）
+	 *
+	 * 完成后 mode_config 中的 CRTC/Plane/Encoder/Connector 链表均已填充，
+	 * 显示拓扑完整建立。
+	 */
 	ret = component_bind_all(dev, drm_dev);
 	if (ret)
 		goto err_mode_config_cleanup;
 
+	/*
+	 * 为所有已注册的 connector 附加 TV 显示调节属性
+	 * （brightness、saturation、hue、contrast）。
+	 * 这些属性允许用户空间调节输出画面的色彩效果。
+	 */
 	rockchip_attach_connector_property(drm_dev);
-	// 初始化 VBlank 机制，用于管理各个 CRTC 的垂直消隐（VBlank）中断与帧计数
+
+	/* ================================================================
+	 * 阶段 6：VBlank、属性默认值、中断模式
+	 * ================================================================ */
+
+	/*
+	 * 为每个 CRTC 初始化 VBlank 管理结构（drm_vblank_crtc）：
+	 *   分配 vblank 计数器、时间戳数组、引用计数等
+	 *   注册 VBlank 等待队列（供 drm_wait_vblank ioctl 使用）
+	 * num_crtc 在 vop2_bind() 时已由 drm_crtc_init_with_planes() 自动统计。
+	 */
 	ret = drm_vblank_init(drm_dev, drm_dev->mode_config.num_crtc);
 	if (ret)
 		goto err_unbind_all;
 
+	/*
+	 * drm_mode_config_reset：将所有 CRTC/Plane/Connector 的 state 重置为初始值，
+	 * 调用各对象的 funcs->reset() 回调，确保原子状态机从已知干净状态启动。
+	 */
 	drm_mode_config_reset(drm_dev);
+
+	/*
+	 * 为各 connector 和 CRTC 的属性设置 Rockchip 平台的合理默认值
+	 * （如 HDR 参数、色彩空间、scaling 模式等）。
+	 */
 	rockchip_drm_set_property_default(drm_dev);
 
 	/*
-	 * enable drm irq mode.
-	 * - with irq_enabled = true, we can use the vblank feature.
+	 * 开启 DRM IRQ 模式。
+	 * irq_enabled = true 后，VBlank 中断处理函数可以正常调用
+	 * drm_handle_vblank()，VBlank 事件机制（page flip 完成通知等）得以工作。
 	 */
 	drm_dev->irq_enabled = true;
 
-	/* init kms poll for handling hpd */
+	/* ================================================================
+	 * 阶段 7：热插拔轮询、GEM 池、Loader logo、fbdev 兼容层
+	 * ================================================================ */
+
+	/*
+	 * 初始化 KMS 输出轮询机制（用于 VGA 等无 HPD 中断的接口）。
+	 * 对于 DSI/HDMI（有 HPD 中断），此机制不会实际运行，
+	 * 但框架仍需初始化以统一管理热插拔事件通知路径。
+	 */
 	drm_kms_helper_poll_init(drm_dev);
 
+	/*
+	 * 初始化 Rockchip GEM 内存池（secure_buffer_pool）。
+	 * 预先分配安全（TEE/secure）内存区域，用于 DRM 内容保护（HDCP）场景，
+	 * 防止普通进程访问受保护的视频帧缓冲。
+	 */
 	rockchip_gem_pool_init(drm_dev);
+
 #ifndef MODULE
+	/*
+	 * 显示 bootloader/uboot 阶段已加载的 logo（开机画面无缝衔接）。
+	 * 仅在内建驱动（非模块）时执行，确保内核启动时 logo 持续显示，
+	 * 避免内核初始化期间屏幕黑屏。模块加载时跳过此步骤。
+	 */
 	show_loader_logo(drm_dev);
 #endif
+
+	/*
+	 * 将 DTS 中 memory-region 指定的保留内存区域关联到 drm_dev->dev。
+	 * 保留内存用于：
+	 *   "drm-logo"：uboot logo framebuffer（无缝显示开机画面）
+	 *   "drm-cubic-lut"：3D LUT 数据（色彩校准查找表，需要大块连续内存）
+	 * 失败时仅打印 debug 日志，不影响主流程（保留内存是可选优化）。
+	 */
 	ret = of_reserved_mem_device_init(drm_dev->dev);
 	if (ret)
 		DRM_DEBUG_KMS("No reserved memory region assign to drm\n");
 
+	/*
+	 * 初始化 fbdev 兼容层（/dev/fb0），供不支持 DRM 的旧式应用使用。
+	 * 创建一个覆盖主显示器全屏的 framebuffer，将 fb_ops 映射到 DRM 原子提交。
+	 */
 	ret = rockchip_drm_fbdev_init(drm_dev);
 	if (ret)
 		goto err_kms_helper_poll_fini;
 
+	/*
+	 * 为支持热插拔的 CRTC（输出类型为 HDMI/DVI/DP/TV 等）增加 fbdev framebuffer
+	 * 的额外引用计数。
+	 *
+	 * 原因：支持热插拔的接口（如 HDMI）在屏幕拔出后会触发 connector 断开，
+	 * DRM 核心可能尝试释放关联的 framebuffer。增加额外引用确保 fbdev 的 fb 对象
+	 * 在 HDMI 热插拔期间不会被意外释放，保持 /dev/fb0 的持续可用性。
+	 * DSI/eDP 等嵌入式固定屏幕无需此处理（不会热插拔）。
+	 */
 	drm_for_each_crtc(crtc, drm_dev) {
 		struct drm_fb_helper *helper = private->fbdev_helper;
 		struct rockchip_crtc_state *s = NULL;
@@ -1765,30 +2259,50 @@ static int rockchip_drm_bind(struct device *dev)
 
 		s = to_rockchip_crtc_state(crtc->state);
 		if (is_support_hotplug(s->output_type))
-			drm_framebuffer_get(helper->fb);
+			drm_framebuffer_get(helper->fb); /* +1 引用，防止热插拔时意外释放 */
 	}
 
+	/*
+	 * 允许使用带 modifier 的帧缓冲格式（如 AFBC 压缩格式）。
+	 * modifier 描述帧缓冲在内存中的特殊布局（如 AFBC tile 排列），
+	 * 开启后 GPU 输出的 AFBC buffer 可直接被 VOP2 硬件解压扫描，
+	 * 节省 DDR 带宽约 30~50%。
+	 */
 	drm_dev->mode_config.allow_fb_modifiers = true;
 
+	/* ================================================================
+	 * 阶段 8：向用户空间注册 DRM 设备
+	 * ================================================================ */
+
+	/*
+	 * drm_dev_register：将 drm_dev 注册到内核设备模型，
+	 * 创建 /dev/dri/card0 和 /dev/dri/renderD128 字符设备节点，
+	 * 从此刻起用户空间可以 open/ioctl DRM 设备，合成器可以开始工作。
+	 * 这是整个 DRM 初始化的最后一步，也是对外"开门"的时刻。
+	 */
 	ret = drm_dev_register(drm_dev, 0);
 	if (ret)
 		goto err_fbdev_fini;
 
 	return 0;
+
+	/* ================================================================
+	 * 错误回滚：逆序释放已初始化的资源
+	 * ================================================================ */
 err_fbdev_fini:
 	rockchip_drm_fbdev_fini(drm_dev);
 err_kms_helper_poll_fini:
 	rockchip_gem_pool_destroy(drm_dev);
-	drm_kms_helper_poll_fini(drm_dev);
+	drm_kms_helper_poll_fini(drm_dev);       /* 停止 KMS 输出轮询工作队列 */
 err_unbind_all:
-	component_unbind_all(dev, drm_dev);
+	component_unbind_all(dev, drm_dev);       /* 逆序调用所有子组件的 unbind() */
 err_mode_config_cleanup:
-	drm_mode_config_cleanup(drm_dev);
-	rockchip_iommu_cleanup(drm_dev);
+	drm_mode_config_cleanup(drm_dev);         /* 释放所有 KMS 对象和属性 */
+	rockchip_iommu_cleanup(drm_dev);          /* 卸载 IOMMU domain，解除映射 */
 err_free:
 	drm_dev->dev_private = NULL;
 	dev_set_drvdata(dev, NULL);
-	drm_dev_put(drm_dev);
+	drm_dev_put(drm_dev);                     /* 减引用，触发 drm_dev 内存释放 */
 	return ret;
 }
 
@@ -2060,6 +2574,7 @@ static int rockchip_drm_get_vcnt_event_ioctl(struct drm_device *dev, void *data,
 	return 0;
 }
 
+//ROCKCHIP_GEM_CREATE等定义在kernel\include\uapi\drm\rockchip_drm.h文件中
 static const struct drm_ioctl_desc rockchip_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(ROCKCHIP_GEM_CREATE, rockchip_gem_create_ioctl,
 			  DRM_UNLOCKED | DRM_AUTH | DRM_RENDER_ALLOW),
@@ -2136,6 +2651,87 @@ static const struct dma_buf_ops rockchip_drm_gem_prime_dmabuf_ops = {
 	.end_cpu_access_partial = rockchip_drm_gem_end_cpu_access_partial,
 };
 
+/*
+ * ============================================================
+ * PRIME / DMA-BUF 跨设备缓冲区共享
+ * ============================================================
+ *
+ * 【背景：为什么需要 PRIME？】
+ *
+ * 在 SoC 系统中，多个硬件单元需要共享同一块内存：
+ *
+ *   VPU（视频解码）──解码帧──► DRM（VOP2 显示）
+ *   Camera ISP ──捕获帧──► GPU（渲染）──► DRM（合成显示）
+ *   GPU（渲染）──► VPU（视频编码）
+ *
+ * 如果没有统一的共享机制，每次传递都必须：CPU 读取 → 拷贝 → 写入 → 通知
+ * 这意味着巨大的带宽浪费和延迟。
+ *
+ * PRIME（DRM Buffer Sharing）通过 dma_buf 机制解决了这个问题：
+ *   - 内存只分配一次，多设备共享同一物理页
+ *   - 通过文件描述符在进程/驱动间传递"权柄"
+ *   - 每个设备建立自己的 IOMMU 映射（dma_buf_attachment），无需数据拷贝
+ *
+ * 【关键数据结构关系】
+ *
+ *   用户空间 fd（整数）
+ *        │  dma_buf_get(fd)
+ *        ▼
+ *   struct dma_buf                  ← 共享缓冲区的"身份证"
+ *     .ops   = rockchip_drm_gem_prime_dmabuf_ops
+ *     .priv  = struct drm_gem_object  ← 导出方的 GEM 对象
+ *     .resv  = reservation_object     ← fence 同步对象
+ *        │  dma_buf_attach(dmabuf, dev)
+ *        ▼
+ *   struct dma_buf_attachment       ← "某设备对该 buffer 的使用声明"
+ *     .dmabuf = dma_buf
+ *     .dev    = attach_dev
+ *        │  dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL)
+ *        ▼
+ *   struct sg_table                 ← 该设备可用的物理地址散列表
+ *     （IOMMU 会将其映射为 IOVA 供硬件 DMA 使用）
+ *        │  gem_prime_import_sg_table(dev, attach, sgt)
+ *        ▼
+ *   struct drm_gem_object (import)  ← 导入方的 GEM 对象，包装上述 sgt
+ *     .import_attach = attach
+ *
+ * 【CONFIG_DMABUF_CACHE 说明】
+ *
+ *   这是 Rockchip 对标准 dma_buf 的性能优化扩展：
+ *   - 标准路径：每次 import 都要 attach + map（IOMMU 建表，耗时）
+ *   - 缓存路径：attach/map 结果被缓存，同一 dma_buf 再次 import 时
+ *               直接复用已有的 attachment 和 sgt，跳过 IOMMU 重映射
+ *
+ *   非缓存路径（!CONFIG_DMABUF_CACHE）使用 release callback 机制：
+ *   在 dma_buf 上挂一个回调，当 dma_buf 引用计数归零时，
+ *   自动清理本驱动为其创建的 import 资源（sgt、attachment、GEM 对象）。
+ */
+
+/*
+ * drm_gem_prime_dmabuf_release_callback - dma_buf 释放时的清理回调
+ *
+ * 仅在 !CONFIG_DMABUF_CACHE 时编译。
+ *
+ * 【触发时机】
+ *   当某个 *外部* dma_buf 的文件引用计数归零（即所有持有者都关闭了 fd），
+ *   dma_buf 核心层会调用此回调，通知曾经 import 过这个 dma_buf 的 Rockchip DRM 驱动。
+ *
+ * 【清理步骤】
+ *   1. dma_buf_unmap_attachment()：撤销当初 dma_buf_map_attachment() 建立的 sg_table
+ *      映射，释放 IOMMU 表项（IOVA → 物理地址的映射）。
+ *   2. dma_buf_detach()：断开 attachment，通知 dma_buf 导出方此设备不再使用该 buffer。
+ *   3. drm_gem_object_put_unlocked()：释放 Rockchip GEM import 对象的引用计数，
+ *      若计数归零则销毁该 GEM 对象并释放其持有的资源。
+ *   4. kfree(cb_data)：释放回调数据结构本身。
+ *
+ * 【为什么需要这个回调，而不是在 GEM 对象释放时清理？】
+ *   import GEM 对象的生命周期 ≤ 被 import 的 dma_buf 的生命周期。
+ *   当 dma_buf 即将释放时，必须先撤销 attach/map，否则导出方的内存页
+ *   被释放后，attachment 和 sgt 将成为野指针。
+ *   此回调确保以正确的顺序、在正确的时机清理资源。
+ *
+ * @data: 指向 struct drm_prime_callback_data，包含 obj（GEM对象）和 sgt（散列表）
+ */
 #if !defined(CONFIG_DMABUF_CACHE)
 static void drm_gem_prime_dmabuf_release_callback(void *data)
 {
@@ -2145,16 +2741,94 @@ static void drm_gem_prime_dmabuf_release_callback(void *data)
 		struct dma_buf_attachment *attach = cb_data->obj->import_attach;
 		struct sg_table *sgt = cb_data->sgt;
 
+		/* 步骤1：解除 IOMMU 映射，释放 sg_table 中的 IOVA 资源 */
 		if (sgt)
 			dma_buf_unmap_attachment(attach, sgt,
 						 DMA_BIDIRECTIONAL);
+		/* 步骤2：断开 attachment，通知导出方本设备已离场 */
 		dma_buf_detach(attach->dmabuf, attach);
+		/* 步骤3：递减 import GEM 对象引用计数，可能触发其销毁 */
 		drm_gem_object_put_unlocked(cb_data->obj);
+		/* 步骤4：释放回调数据结构 */
 		kfree(cb_data);
 	}
 }
 #endif
 
+/*
+ * rockchip_drm_gem_prime_import_dev - 将外部 dma_buf 导入为 Rockchip GEM 对象
+ *
+ * 这是 PRIME import 的核心实现，包含三条代码路径，从快到慢依次尝试：
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  路径1（最快）：自导入（Self-Import）                                     │
+ * │  条件：dma_buf 是由本 Rockchip DRM 设备导出的（ops 指针匹配，且 dev 相同）  │
+ * │  动作：直接递增 GEM 对象引用计数并返回，完全跳过 IOMMU 操作               │
+ * │  场景：用户空间先 export 一个 GEM buffer 为 fd，再将该 fd 传回本驱动 import │
+ * │        （如 wayland compositor 的零拷贝共享路径）                         │
+ * │                                                                          │
+ * │  路径2（较快，仅 !CONFIG_DMABUF_CACHE）：回调缓存命中                      │
+ * │  条件：本驱动之前已经 import 过该 dma_buf，并留下了 release callback       │
+ * │  动作：从回调数据中取出已有的 GEM 对象，递增引用计数返回                   │
+ * │  场景：同一个 dma_buf 被反复 import（如多次提交同一帧 buffer）              │
+ * │  优点：避免重复的 dma_buf_attach() 和 IOMMU 重新建表（后者代价较高）        │
+ * │                                                                          │
+ * │  路径3（完整流程）：首次 import                                            │
+ * │  步骤：attach → get_dma_buf → (alloc cb_data) → map_attachment            │
+ * │         → import_sg_table → 记录 import_attach                           │
+ * │         → (set_release_callback + dma_buf_put + gem_get)                 │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ *
+ * 【路径3详解：完整 import 流程】
+ *
+ *   ① dma_buf_attach(dma_buf, attach_dev)
+ *      - 向 dma_buf 导出方声明"本设备要使用此 buffer"
+ *      - 导出方驱动的 .attach 回调被触发（如 drm_gem_map_attach()），
+ *        可以做设备相关的准备（如 pin 住内存页，禁止迁移）
+ *      - 返回 struct dma_buf_attachment，代表此设备与该 buffer 的绑定关系
+ *
+ *   ② get_dma_buf(dma_buf)
+ *      - 递增 dma_buf 的文件引用计数（file->f_count）
+ *      - 目的：防止在我们还持有 attachment 期间，dma_buf 被其他路径释放
+ *      - 对应的 dma_buf_put() 在后续恰当时机调用（见下文 ③-d）
+ *
+ *   ③-a dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL)
+ *      - 这是最耗时的步骤：触发导出方驱动的 .map_dma_buf 回调
+ *      - 回调内部通常调用 dma_map_sg()，在 IOMMU 中建立
+ *        "IOVA（设备虚拟地址）→ 物理地址" 的映射表
+ *      - 返回 struct sg_table，包含了 attach_dev 可用的 IOVA 地址列表
+ *      - CONFIG_DMABUF_CACHE 就是为了缓存这一步的结果
+ *
+ *   ③-b gem_prime_import_sg_table(dev, attach, sgt)
+ *      - 驱动自定义的回调（Rockchip 为 rockchip_gem_prime_import_sg_table()）
+ *      - 将 sg_table 包装成一个 GEM 对象（struct drm_gem_object）
+ *      - GEM 对象将成为 DRM 框架内代表此 buffer 的句柄
+ *
+ *   ③-c obj->import_attach = attach
+ *      - 记录 attachment，以便后续 GEM 对象销毁时知道如何清理
+ *
+ *   ③-d（仅 !CONFIG_DMABUF_CACHE）注册 release callback
+ *      - dma_buf_set_release_callback()：将 drm_gem_prime_dmabuf_release_callback
+ *        和 cb_data（含 obj、sgt 指针）绑定到 dma_buf 上
+ *      - dma_buf_put()：与步骤 ② 的 get_dma_buf() 配对，释放本函数持有的引用
+ *        此后 dma_buf 的生命周期由其他持有者（用户空间 fd 等）维持
+ *      - drm_gem_object_get()：额外增加 GEM 对象的引用计数
+ *        保证即使用户空间不再持有 GEM handle，GEM 对象也能存活到 dma_buf 释放
+ *        （因为 release callback 还需要访问 obj）
+ *
+ * 【引用计数平衡总结（!CONFIG_DMABUF_CACHE 路径）】
+ *
+ *   dma_buf 引用（f_count）：
+ *     get_dma_buf()   +1  →  dma_buf_put()   -1  （本函数内平衡）
+ *   GEM 对象引用：
+ *     import_sg_table 创建时 = 1  （基础引用，由用户空间 GEM handle 持有）
+ *     drm_gem_object_get()    +1  （release callback 持有，直到 dma_buf 释放）
+ *
+ * @dev:        Rockchip DRM device，目标 GEM 对象归属的设备
+ * @dma_buf:    要 import 的外部共享缓冲区
+ * @attach_dev: 执行 DMA 操作的实际设备（通常即 dev->dev，但 IOMMU 场景下可指定子设备）
+ * @return:     成功返回新 GEM 对象指针，失败返回 ERR_PTR(-errno)
+ */
 static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_device *dev,
 								struct dma_buf *dma_buf,
 								struct device *attach_dev)
@@ -2167,19 +2841,89 @@ static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_devic
 #endif
 	int ret;
 
+	/*
+	 * 【路径1：自导入快速路径】
+	 * 检查 dma_buf 是否由本 Rockchip DRM 设备导出：
+	 *   - ops 指针相同（同一套操作函数表）→ 是 Rockchip DRM 格式的 dma_buf
+	 *   - obj->dev == dev → 是本设备导出的（而不是另一个 Rockchip DRM 实例）
+	 *
+	 * 此时无需经过 IOMMU 重映射，直接递增 GEM 对象的引用计数即可。
+	 * 语义：import 等同于"我也持有这个 GEM 对象"，引用计数 +1 表示新的持有者。
+	 */
 	if (dma_buf->ops == &rockchip_drm_gem_prime_dmabuf_ops) {
 		obj = dma_buf->priv;
 		if (obj->dev == dev) {
 			/*
-			 * Importing dmabuf exported from out own gem increases
-			 * refcount on gem itself instead of f_count of dmabuf.
+			 * 从自身导出的 dma_buf 再次 import 时，
+			 * 递增 GEM 对象自身引用计数（而非 dma_buf 文件引用计数），
+			 * 因为 GEM 对象就是 dma_buf 的 priv，两者共生。
 			 */
 			drm_gem_object_get(obj);
 			return obj;
 		}
 	}
 
+
+/*
+
+## 为什么是 `!defined(CONFIG_DMABUF_CACHE)`？
+### 问题背景：重复 import 的开销
+
+`dma_buf_attach()` + `dma_buf_map_attachment()` 
+在 IOMMU 场景下代价很高（需要建 IOVA 映射表）。
+同一个 `dma_buf` 如果被反复 import（比如同一个视频帧 buffer 每帧都提交一次），
+就会反复触发这些昂贵操作。
+
+### 两种解决方案
+
+**方案 A：`CONFIG_DMABUF_CACHE`（启用时）**
+
+Rockchip 在 `dma_buf` 框架层面直接做了缓存：
+- `dma_buf_cache_attach()` / `dma_buf_cache_map_attachment()` 替换了原生 API
+- attachment 和 sgt 的结果**永久缓存在 dma_buf 结构体内**
+- 任何驱动再次 attach/map 同一个 dma_buf 时，**直接命中缓存，不走 IOMMU 重映射**
+- 这是一个**系统级缓存**，对所有使用者透明
+
+此时，路径2和 release callback 完全**没有存在的必要**，因为缓存机制已经在更低层解决了重复开销的问题。
+
+---
+
+**方案 B：`!CONFIG_DMABUF_CACHE`（未启用时）**
+
+没有系统级缓存，Rockchip DRM 驱动就在**自己这一层**做了一个"软缓存"：
+- 首次 import 成功后，通过 `dma_buf_set_release_callback()` 在 `dma_buf` 上挂一个钩子，附带已建好的 `obj` 和 `sgt`
+- 再次 import 同一个 `dma_buf` 时，`dma_buf_get_release_callback_data()` 发现钩子存在，直接取出缓存的 `obj` 返回（路径2）
+- 这是一个**驱动私有缓存**，只对 Rockchip DRM 有效
+
+---
+
+对比总结：
+			CONFIG_DMABUF_CACHE	      !CONFIG_DMABUF_CACHE
+缓存层次	dma_buf 框架层（系统级）	Rockchip DRM 驱动层（私有）
+缓存内容	attachment + sg_table	  GEM对象 + sg_table
+缓存粒度	以（dmabuf, device）为 key，链表支持多设备	以（dmabuf, 本驱动）为 key，单条目
+缓存方式	替换 attach/map API，dmabuf->dtor_data	release callback + cb_data
+有效范围	所有驱动共享			   仅 Rockchip DRM 自己用
+release callback	不需要	          必须，作为"缓存容器"
+
+两套方案的核心都是缓存 sg_table，
+因为 dma_buf_map_attachment() 触发 IOMMU 建表是最贵的操作。
+区别在于缓存粒度：DMABUF_CACHE 更细（可复用 attachment），
+release callback 方案更粗（直接复用整个 GEM 对象）。 
+
+*/
+
 #if !defined(CONFIG_DMABUF_CACHE)
+	/*
+	 * 【路径2：回调缓存命中（!CONFIG_DMABUF_CACHE 专用）】
+	 * 查询 dma_buf 上是否已经挂了本驱动的 release callback：
+	 *   - 若存在，说明本驱动之前已经完整 import 过此 dma_buf
+	 *   - 从 cb_data 中取出之前创建的 GEM 对象，直接递增引用计数返回
+	 *   - 避免重复 attach + map，节省 IOMMU 建表开销
+	 *
+	 * 注意：还需确认 cb_data->obj->dev == dev，
+	 * 防止不同 Rockchip DRM 实例之间互相误用。
+	 */
 	cb_data = dma_buf_get_release_callback_data(dma_buf,
 					drm_gem_prime_dmabuf_release_callback);
 	if (cb_data && cb_data->obj && cb_data->obj->dev == dev) {
@@ -2188,16 +2932,28 @@ static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_devic
 	}
 #endif
 
+	/* 驱动必须实现 gem_prime_import_sg_table 才能接受外部 buffer */
 	if (!dev->driver->gem_prime_import_sg_table)
 		return ERR_PTR(-EINVAL);
 
+	/*
+	 * 【路径3：完整 import 流程 —— 步骤①】
+	 * attach：向 dma_buf 导出方声明本设备将使用此 buffer。
+	 * 触发导出方驱动的 .attach 回调，可能做 pin 内存等准备工作。
+	 */
 	attach = dma_buf_attach(dma_buf, attach_dev);
 	if (IS_ERR(attach))
 		return ERR_CAST(attach);
 
+	/*
+	 * 步骤②：递增 dma_buf 文件引用计数，防止在 map_attachment 过程中被释放。
+	 * 对应的 dma_buf_put() 在注册完 release callback 后立即调用（见下文），
+	 * 此后 dma_buf 的生命周期交由调用者和 release callback 共同管理。
+	 */
 	get_dma_buf(dma_buf);
 
 #if !defined(CONFIG_DMABUF_CACHE)
+	/* 预先分配 release callback 的数据结构，失败则回滚 attach */
 	cb_data = kmalloc(sizeof(*cb_data), GFP_KERNEL);
 	if (!cb_data) {
 		ret = -ENOMEM;
@@ -2205,49 +2961,131 @@ static struct drm_gem_object *rockchip_drm_gem_prime_import_dev(struct drm_devic
 	}
 #endif
 
+	/*
+	 * 步骤③-a：map_attachment — 最核心也是最耗时的步骤。
+	 * 触发 .map_dma_buf 回调（drm_gem_map_dma_buf），内部调用 dma_map_sg()，
+	 * 在 IOMMU 中建立"IOVA → 物理地址"的映射表，
+	 * 返回 sg_table（设备可用的散列地址表）。
+	 * CONFIG_DMABUF_CACHE 通过缓存此 sgt，避免重复建表。
+	 */
 	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		goto fail_detach;
 	}
 
+	/*
+	 * 步骤③-b：将 sg_table 包装为 Rockchip GEM 对象。
+	 * 实际调用 rockchip_gem_prime_import_sg_table()，
+	 * 该函数分配 struct rockchip_gem_object，记录物理地址或 IOVA，
+	 * 以便 VOP2 硬件 DMA 直接读取帧数据。
+	 */
 	obj = dev->driver->gem_prime_import_sg_table(dev, attach, sgt);
 	if (IS_ERR(obj)) {
 		ret = PTR_ERR(obj);
 		goto fail_unmap;
 	}
 
+	/*
+	 * 步骤③-c：记录 attachment，GEM 对象销毁时据此清理 map/attach 资源。
+	 * 若未来调用 drm_gem_object_free()，会通过此指针调用
+	 * dma_buf_unmap_attachment() 和 dma_buf_detach()。
+	 */
 	obj->import_attach = attach;
 
 #if !defined(CONFIG_DMABUF_CACHE)
+	/*
+	 * 步骤③-d（!CONFIG_DMABUF_CACHE）：注册 release callback 并平衡引用计数。
+	 *
+	 * ① 填充 cb_data，记录 obj 和 sgt，供回调清理时使用。
+	 * ② dma_buf_set_release_callback()：将回调绑定到 dma_buf，
+	 *    当 dma_buf 最终释放时，自动调用 drm_gem_prime_dmabuf_release_callback()
+	 *    完成 unmap → detach → gem_put 的清理序列。
+	 * ③ dma_buf_put()：与步骤② 的 get_dma_buf() 配对，释放本函数的临时引用。
+	 *    此后 dma_buf 由用户空间 fd 持有，本驱动通过 release callback 感知其释放。
+	 * ④ drm_gem_object_get()：额外增加 GEM 对象引用，防止 GEM handle 被关闭后
+	 *    GEM 对象提前销毁（release callback 还需要访问 obj 进行清理）。
+	 *    此引用由 release callback 中的 drm_gem_object_put_unlocked() 释放。
+	 */
 	cb_data->obj = obj;
 	cb_data->sgt = sgt;
 	dma_buf_set_release_callback(dma_buf,
 			drm_gem_prime_dmabuf_release_callback, cb_data);
-	dma_buf_put(dma_buf);
-	drm_gem_object_get(obj);
+	dma_buf_put(dma_buf);        /* ③ 释放本函数的临时 dma_buf 引用 */
+	drm_gem_object_get(obj);     /* ④ release callback 的额外持有引用 */
 #endif
 
 	return obj;
 
 fail_unmap:
+	/* map_attachment 之后失败：先撤销 IOMMU 映射 */
 	dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
 fail_detach:
 #if !defined(CONFIG_DMABUF_CACHE)
 	kfree(cb_data);
 #endif
+	/* 撤销 attach，通知导出方本设备放弃使用 */
 	dma_buf_detach(dma_buf, attach);
+	/* 与 get_dma_buf() 配对，释放对 dma_buf 的临时引用 */
 	dma_buf_put(dma_buf);
 
 	return ERR_PTR(ret);
 }
 
+/*
+ * rockchip_drm_gem_prime_import - PRIME import 的标准入口
+ *
+ * 挂载到 struct drm_driver.gem_prime_import，
+ * 由 DRM 核心在用户空间调用 DRM_IOCTL_PRIME_FD_TO_HANDLE 时触发。
+ *
+ * 这是一个薄封装，固定以 dev->dev（Rockchip DRM 平台设备）作为
+ * attach_dev 参数传入 rockchip_drm_gem_prime_import_dev()。
+ *
+ * attach_dev 的作用：dma_buf_attach(dma_buf, attach_dev) 会根据
+ * attach_dev 所属的 IOMMU group，在该设备的 IOMMU domain 中建立
+ * IOVA → 物理地址的页表映射。
+ *
+ * RK3568 上 VOP2 的所有 VP 共享同一个 IOMMU domain（即 dev->dev 的 domain），
+ * 因此所有 import 统一用 dev->dev 即可，无需区分具体的 VP。
+ */
 static struct drm_gem_object *rockchip_drm_gem_prime_import(struct drm_device *dev,
 							    struct dma_buf *dma_buf)
 {
 	return rockchip_drm_gem_prime_import_dev(dev, dma_buf, dev->dev);
 }
 
+/*
+ * rockchip_drm_gem_prime_export - 将 Rockchip GEM 对象导出为 dma_buf
+ *
+ * 这是挂载到 struct drm_driver.gem_prime_export 的标准回调，
+ * 由 DRM 核心在用户空间调用 DRM_IOCTL_PRIME_HANDLE_TO_FD 时触发。
+ *
+ * 【导出流程】
+ *   1. 填充 dma_buf_export_info，描述要导出的 buffer 的属性和操作函数表。
+ *   2. 若驱动实现了 gem_prime_res_obj()，将 GEM 的 reservation_object
+ *      （即 fence 同步对象）传递给 dma_buf，使其他驱动 import 后
+ *      能感知本 buffer 上的 GPU fence，实现跨设备显式同步。
+ *   3. drm_gem_dmabuf_export()：创建 dma_buf 文件并返回。
+ *      用户空间通过 DRM_IOCTL_PRIME_HANDLE_TO_FD 获得该文件的 fd，
+ *      再将 fd 传递给其他进程或驱动（如 VPU、Camera 驱动）进行 import。
+ *
+ * 【exp_info 字段说明】
+ *   .exp_name = KBUILD_MODNAME：调试用名称（"rockchip"），
+ *               注释 "white lie for debug" 表明这只是标识符，并非精确来源。
+ *   .owner    = dev->driver->fops->owner：模块所有者，防止 dma_buf 存活期间模块被卸载。
+ *   .ops      = rockchip_drm_gem_prime_dmabuf_ops：Rockchip 定制的 dma_buf 操作函数表，
+ *               包含 attach/detach/map/unmap/cpu_access 等回调，
+ *               也是路径1自导入检测的"指纹"（通过 ops 指针比较识别来源）。
+ *   .size     = obj->size：buffer 大小（字节），暴露给 import 方。
+ *   .flags    = flags：O_CLOEXEC 等标志，控制 fd 行为。
+ *   .priv     = obj：dma_buf->priv 指向 GEM 对象，是 import 路径1快速返回的基础。
+ *   .resv     = reservation_object：fence 同步对象，实现"GPU写完，显示才读"的显式同步。
+ *
+ * @dev:   Rockchip DRM device
+ * @obj:   要导出的 GEM 对象
+ * @flags: 文件标志（O_CLOEXEC 等）
+ * @return: 指向新创建的 dma_buf 的指针，或 ERR_PTR(-errno)
+ */
 static struct dma_buf *rockchip_drm_gem_prime_export(struct drm_device *dev,
 						     struct drm_gem_object *obj,
 						     int flags)
@@ -2255,12 +3093,37 @@ static struct dma_buf *rockchip_drm_gem_prime_export(struct drm_device *dev,
 	struct dma_buf_export_info exp_info = {
 		.exp_name = KBUILD_MODNAME, /* white lie for debug */
 		.owner = dev->driver->fops->owner,
+		/* 挂载 Rockchip 定制操作表，也作为自导入快速路径的"指纹" */
 		.ops = &rockchip_drm_gem_prime_dmabuf_ops,
 		.size = obj->size,
 		.flags = flags,
+		/* dma_buf->priv 指向 GEM 对象，自导入路径据此直接返回 obj */
 		.priv = obj,
 	};
 
+	/* 【笔记钩子】
+	 * 【跨设备同步问题】
+	 * GPU 渲染一帧后，VPU/Camera 等其他设备通过 PRIME fd 拿到这块 buffer 并读取。
+	 * 但 GPU 的写操作是异步的——用户空间提交 draw call 后 GPU 尚未完成，
+	 * 其他设备若立即 DMA 读取，就会拿到渲染到一半的"脏帧"。
+	 *
+	 * 解决方案是 reservation_object（内含 exclusive fence）：
+	 *   - GPU 提交工作时在 resv 上挂一个 exclusive fence（表示"我还没写完"）
+	 *   - GPU 真正写完后，fence 触发（signal）
+	 *   - import 方在 DMA 读取前调用 dma_buf_reservation_object_get() 拿到 resv，
+	 *     等待 exclusive fence 触发，确认 GPU 写完后再开始读取
+	 *
+	 * 【为何要填 exp_info.resv】
+	 * GEM 对象本身已经携带了一个 reservation_object（GPU 驱动往里写 fence）。
+	 * 若不填 exp_info.resv，dma_buf 框架会给这个 dma_buf 分配一个全新的、
+	 * 独立的 reservation_object——它和 GEM 的 resv 是两个不同的对象，
+	 * GPU 往 GEM resv 里写的 fence，import 方从 dma_buf resv 里根本看不到，
+	 * 跨设备同步就彻底失效了。
+	 *
+	 * 因此，通过 gem_prime_res_obj() 取出 GEM 自身的 resv 填入 exp_info，
+	 * 让 dma_buf 与 GEM 共享同一个 reservation_object，
+	 * 保证 import 方等到的 fence 就是 GPU 真正写完时触发的那个。
+	 */
 	if (dev->driver->gem_prime_res_obj)
 		exp_info.resv = dev->driver->gem_prime_res_obj(obj);
 
@@ -2382,6 +3245,42 @@ static void rockchip_drm_match_remove(struct device *dev)
 		device_link_del(link);
 }
 
+/**
+ * rockchip_drm_match_add - 扫描总线，为 component master 构建子组件匹配列表
+ * @dev: Rockchip DRM master 设备（display-subsystem 节点对应的 platform_device）
+ *
+ * 返回值：成功返回填充好的 component_match 指针；失败返回 ERR_PTR(-ENODEV)
+ *
+ * ## 背景：component 框架的工作原理
+ *
+ * Linux component 框架用于解决多驱动聚合问题：
+ * 一个复杂设备（如 Rockchip DRM）由多个相互独立的子驱动构成
+ * （VOP2、DSI、HDMI、eDP 等），只有当**所有子组件**都 probe 完成后，
+ * master 驱动才能完整地初始化整个显示子系统。
+ *
+ * 流程概览：
+ *   ① 内核启动时，子驱动（如 dw_mipi_dsi_driver）probe 成功后
+ *      调用 component_add()，将自己注册为"待聚合的子组件"
+ *   ② master（本驱动）probe 时调用本函数，扫描总线找出所有匹配的子设备，
+ *      构建 match 列表，再调用 component_master_add_with_match()
+ *   ③ component 框架检查 match 列表中的所有子组件是否都已就绪，
+ *      若全部就绪则调用 master 的 .bind()（rockchip_drm_bind），
+ *      否则等待剩余子组件 probe 完成后自动触发
+ *
+ * ## 本函数的核心逻辑：遍历所有已注册的子驱动，找到对应的设备实例
+ *
+ * rockchip_sub_drivers[] 是在 rockchip_drm_init() 中通过
+ * ADD_ROCKCHIP_SUB_DRIVER 宏注册的子驱动指针数组，包含：
+ *   vop2_platform_driver        → VOP2（显示控制器，提供 CRTC/Plane）
+ *   dw_mipi_dsi_driver          → MIPI DSI 控制器（提供 Encoder/Connector）
+ *   dw_hdmi_rockchip_pltfm_driver → HDMI 控制器
+ *   rockchip_dp_driver          → eDP/DP 控制器
+ *   ... 等
+ *
+ * 对于每一个子驱动，需要找到总线上**所有**由该驱动管理的设备实例。
+ * 之所以是"所有"而非"一个"，是因为同一个驱动可能管理多个设备
+ * （如 DSI0 和 DSI1 都由 dw_mipi_dsi_driver 管理，需要都加入 match）。
+ */
 static struct component_match *rockchip_drm_match_add(struct device *dev)
 {
 	struct component_match *match = NULL;
@@ -2391,23 +3290,74 @@ static struct component_match *rockchip_drm_match_add(struct device *dev)
 		struct platform_driver *drv = rockchip_sub_drivers[i];
 		struct device *p = NULL, *d;
 
+		/*
+		 * 内层 do-while 循环：在 platform_bus 上迭代查找由 drv 管理的所有设备。
+		 *
+		 * bus_find_device() 语义：
+		 *   从链表中 p 节点的**下一个**开始遍历，逐个调用 match 回调，
+		 *   返回第一个匹配的设备（已增加引用计数）。
+		 *   传入 platform_bus_type.match 作为匹配函数，它检查设备的 driver 字段
+		 *   是否等于 &drv->driver，即"该设备是否由此驱动管理"。
+		 *
+		 * 迭代机制（游标前进）：
+		 *   p = NULL  → 第一次调用，从链表头开始搜索，找到第一个匹配设备 d1
+		 *   put_device(p=NULL) → 对 NULL 无操作
+		 *   p = d1    → 下一次从 d1 之后继续搜索，找到 d2（若存在）
+		 *   put_device(d1)     → 释放上一个设备的引用，防止引用计数泄漏
+		 *   p = d2    → 继续...
+		 *   ...
+		 *   d = NULL  → 没有更多匹配设备，break 退出循环
+		 *   put_device(p=最后一个d) → 释放最后找到的设备引用
+		 *
+		 * 注意：找到设备 d 后，d 的引用计数已被 bus_find_device 增加，
+		 * 在 put_device(p) 之前 p 仍持有上一个设备的引用，
+		 * 赋值 p = d 转移了对 d 的"持有权"，循环末尾通过 put_device(p) 归还。
+		 */
 		do {
 			d = bus_find_device(&platform_bus_type, p, &drv->driver,
 					    (void *)platform_bus_type.match);
-			put_device(p);
-			p = d;
+			put_device(p);  /* 释放上一轮找到的设备引用，p=NULL 时安全 */
+			p = d;          /* 游标前进：下次从 d 之后继续搜索 */
 
 			if (!d)
-				break;
+				break;  /* 此驱动在总线上已无更多设备，换下一个驱动 */
 
+			/*
+			 * device_link_add：在 master 设备与子设备之间建立设备依赖链接。
+			 *
+			 * DL_FLAG_STATELESS：无状态链接，不参与 PM 同步，
+			 * 仅作为"master 依赖此子设备"的拓扑记录，
+			 * 供 rockchip_drm_match_remove() 遍历并删除时使用。
+			 *
+			 * 建立链接的作用：
+			 *   - 确保子设备在 master 之前 probe（内核 PM 域依赖顺序）
+			 *   - master remove 时可通过遍历 dev->links.consumers 批量删除链接
+			 *     （见 rockchip_drm_match_remove）
+			 */
 			device_link_add(dev, d, DL_FLAG_STATELESS);
+
+			/*
+			 * component_match_add：将设备 d 加入 match 列表。
+			 *
+			 * compare_dev 是比较函数：component_master 在检查某个 component
+			 * 是否属于本 match 时，调用 compare_dev(component_dev, d)，
+			 * 直接比较指针是否相等（见 compare_dev 实现）。
+			 *
+			 * component_match_add 内部动态分配/扩展 match 数组，
+			 * 若分配失败则 match 被设为 ERR_PTR，后续统一检查。
+			 */
 			component_match_add(dev, &match, compare_dev, d);
 		} while (true);
 	}
 
 	if (IS_ERR(match))
-		rockchip_drm_match_remove(dev);
+		rockchip_drm_match_remove(dev); /* 分配失败，清理已建立的所有 device_link */
 
+	/*
+	 * match == NULL 意味着没有找到任何子组件（所有子驱动在总线上均无对应设备），
+	 * 通常发生在子驱动尚未 probe（返回 -ENODEV 触发 probe defer）或
+	 * DTS 中没有使能任何显示相关节点的情况。
+	 */
 	return match ?: ERR_PTR(-ENODEV);
 }
 
@@ -2416,51 +3366,151 @@ static const struct component_master_ops rockchip_drm_ops = {
 	.unbind = rockchip_drm_unbind,
 };
 
+/**
+ * rockchip_drm_platform_of_probe - 从 DTS 预检 VOP 拓扑并确定 IOMMU 支持模式
+ * @dev: display-subsystem 节点对应的 platform_device.dev
+ *
+ * 返回值：0 成功；-ENODEV DTS 缺少 ports 属性或所有 VOP 均被禁用
+ *
+ * ## DTS 拓扑背景
+ *
+ * rk3568.dtsi 中的 display-subsystem 节点通过 "ports" 属性引用所有 VOP 输出端口：
+ *
+ *   display-subsystem {
+ *       compatible = "rockchip,display-subsystem";
+ *       ports = <&vop_out>;   ← phandle 数组，每项指向一个 VOP 的 ports 节点
+ *   };
+ *
+ *   vop: vop@fe040000 {
+ *       iommus = <&vop_mmu>;  ← VOP 的 IOMMU 节点
+ *       vop_out: ports {      ← 被 display-subsystem.ports[0] 引用
+ *           vp0: port@0 { ... }   ← VP0（CRTC0）
+ *           vp1: port@1 { ... }   ← VP1（CRTC1）
+ *           vp2: port@2 { ... }   ← VP2（CRTC2）
+ *       };
+ *   };
+ *
+ * 注意：ports 属性引用的是 VOP 的 ports **容器节点**（vop_out），
+ * 而非具体的 VP 端口，port->parent 才是真正的 VOP 设备节点（vop@fe040000）。
+ *
+ * ## 函数职责（两项检查）
+ *
+ * ### 检查 1：确认至少有一个 VOP 可用
+ *
+ * 遍历 "ports" phandle 数组，跳过 parent 节点（VOP 设备）已禁用的条目。
+ * 若所有 ports 条目的 parent 均处于 disabled 状态，返回 -ENODEV，
+ * DRM master probe 失败，不进行后续的 component 聚合。
+ *
+ * ### 检查 2：全局 IOMMU 支持模式决策（"短板效应"）
+ *
+ * is_support_iommu 默认值：
+ *   CONFIG_DRM_ROCKCHIP_VVOP 开启 → false（虚拟 VOP 无 IOMMU）
+ *   正常硬件驱动            → true（假设所有 VOP 都有 IOMMU）
+ *
+ * 对每个可用 VOP，检查其 "iommus" 属性：
+ *   情况 A：iommus 属性存在且对应节点可用（vop_mmu status = "okay"）
+ *     → 该 VOP 支持 IOMMU，is_support_iommu 保持不变
+ *
+ *   情况 B：iommus 属性缺失，或 vop_mmu 节点被禁用
+ *     → 该 VOP 不支持 IOMMU，强制 is_support_iommu = false
+ *
+ * "短板效应"：只要有一个 VOP 不支持 IOMMU，全局标志立即降为 false，
+ * 后续所有 VOP 的帧缓冲分配都退回到物理连续内存（CMA）模式，
+ * 不再尝试通过 IOMMU 做虚拟地址映射。
+ *
+ * 原因：DRM 的帧缓冲是全局共享的，合成器可能将同一块 GEM buffer
+ * 同时显示在多个 CRTC 上，若不同 CRTC 所属 VOP 的 IOMMU 能力不一致，
+ * 统一使用物理连续内存是最安全的保底策略。
+ *
+ * ## is_support_iommu 对后续流程的影响
+ *
+ * rockchip_gem_create()：
+ *   is_support_iommu = true  → dma_alloc_attrs()，允许使用非连续内存 + IOMMU 映射
+ *   is_support_iommu = false → dma_alloc_coherent()，强制物理连续内存（CMA）
+ *
+ * rockchip_drm_iommu_attach_device()：
+ *   is_support_iommu = false → 直接跳过 IOMMU 初始化，不挂载 iommu_domain
+ */
 static int rockchip_drm_platform_of_probe(struct device *dev)
 {
 	struct device_node *np = dev->of_node;
 	struct device_node *port;
-	bool found = false;
+	bool found = false; /* 是否找到至少一个可用 VOP */
 	int i;
 
+	/* display-subsystem 必须有 of_node，否则无法读取 ports 属性 */
 	if (!np)
 		return -ENODEV;
 
+	/*
+	 * 遍历 "ports" phandle 数组（ports[0]、ports[1]、...），
+	 * of_parse_phandle(np, "ports", i) 返回第 i 个 phandle 指向的节点，
+	 * 超出数组范围时返回 NULL，循环终止。
+	 *
+	 * 对于 RK3568，ports = <&vop_out>（只有一个元素），
+	 * port 指向 vop_out（ports 容器节点），port->parent 是 vop@fe040000。
+	 */
 	for (i = 0;; i++) {
 		struct device_node *iommu;
 
 		port = of_parse_phandle(np, "ports", i);
 		if (!port)
-			break;
+			break; /* 数组已遍历完 */
 
+		/*
+		 * 检查 port 的父节点（VOP 设备节点）是否可用（status != "disabled"）。
+		 * 若 VOP 被禁用，其下的所有 VP 端口也无意义，跳过本条目。
+		 * of_node_put() 释放 of_parse_phandle 增加的引用计数，防止泄漏。
+		 */
 		if (!of_device_is_available(port->parent)) {
 			of_node_put(port);
 			continue;
 		}
 
+		/*
+		 * 检查 VOP 设备节点的 "iommus" 属性：
+		 * of_parse_phandle(port->parent, "iommus", 0) 获取第一个 IOMMU 节点
+		 * （如 vop_mmu@fe043e00），再检查其父节点（MMU 控制器本体）是否可用。
+		 *
+		 * 两种情况触发降级（is_support_iommu = false）：
+		 *   1. iommu == NULL：VOP DTS 节点根本没有 "iommus" 属性
+		 *   2. !of_device_is_available(iommu->parent)：
+		 *      iommu->parent 是 MMU 控制器节点，其 status = "disabled"
+		 *      说明 IOMMU 硬件未启用
+		 *
+		 * 一旦降级，全局所有 VOP 都使用物理连续内存（"短板效应"）。
+		 */
 		iommu = of_parse_phandle(port->parent, "iommus", 0);
 		if (!iommu || !of_device_is_available(iommu->parent)) {
 			DRM_DEV_DEBUG(dev,
 				      "no iommu attached for %pOF, using non-iommu buffers\n",
 				      port->parent);
 			/*
-			 * if there is a crtc not support iommu, force set all
-			 * crtc use non-iommu buffer.
+			 * 只要有一个 VOP 不支持 IOMMU，强制全局降级。
+			 * 后续 rockchip_gem_create() 将使用物理连续内存。
 			 */
 			is_support_iommu = false;
 		}
 
-		found = true;
+		found = true; /* 找到至少一个可用的 VOP */
 
-		of_node_put(iommu);
-		of_node_put(port);
+		of_node_put(iommu); /* 释放 iommu 节点引用（iommu 为 NULL 时安全） */
+		of_node_put(port);  /* 释放 port 节点引用 */
 	}
 
+	/*
+	 * i == 0 说明 of_parse_phandle 第一次调用就返回了 NULL，
+	 * 即 display-subsystem 节点完全没有 "ports" 属性，DTS 配置有误。
+	 */
 	if (i == 0) {
 		DRM_DEV_ERROR(dev, "missing 'ports' property\n");
 		return -ENODEV;
 	}
 
+	/*
+	 * i > 0 但 found == false：ports 数组非空，但所有引用的 VOP 均被禁用。
+	 * 说明 DTS 中虽然列出了 VOP，但没有一个处于可用状态，无法初始化显示。
+	 */
 	if (!found) {
 		DRM_DEV_ERROR(dev,
 			      "No available vop found for display-subsystem.\n");
@@ -2470,27 +3520,106 @@ static int rockchip_drm_platform_of_probe(struct device *dev)
 	return 0;
 }
 
+/**
+ * rockchip_drm_platform_probe - Rockchip DRM master 驱动的 probe 函数
+ * @pdev: display-subsystem 节点对应的 platform_device
+ *
+ * 本函数是整个 Rockchip DRM 显示子系统的"启动入口"，
+ * 匹配 DTS 中 compatible = "rockchip,display-subsystem" 的节点后被调用。
+ *
+ * ## 三步初始化流程
+ *
+ * ### 第一步：OF 拓扑预检（rockchip_drm_platform_of_probe）
+ *
+ * 从 DTS 的 display-subsystem 节点出发，遍历其 "ports" 属性列出的所有
+ * VOP 端口，做两项检查：
+ *   检查 1：是否至少有一个可用的 VOP 端口（父节点 status != "disabled"）
+ *   检查 2：每个 VOP 端口是否配置了 IOMMU（iommus 属性）
+ *            若任意一个 VOP 没有 IOMMU，则全局设置 is_support_iommu = false，
+ *            所有帧缓冲都退回到物理连续内存分配（CMA），放弃 IOMMU 地址映射。
+ *
+ * VVOP（虚拟 VOP，用于模拟器/测试）例外：跳过 OF 检查，直接继续。
+ *
+ * ### 第二步：构建子组件 match 列表（rockchip_drm_match_add）
+ *
+ * 扫描 platform_bus 上所有由 rockchip_sub_drivers[] 管理的设备实例，
+ * 将它们加入 match 列表，并建立 device_link 依赖关系。
+ * match 列表是 component 框架判断"所有子组件是否就绪"的依据。
+ *
+ * 若 match 为 ERR_PTR（所有子驱动均未 probe 或 DTS 中无相关节点），
+ * 直接返回错误，rockchip_drm_bind() 不会被调用。
+ *
+ * ### 第三步：注册为 component master（component_master_add_with_match）
+ *
+ * 将本设备注册为 component master，并传入 match 列表和操作集：
+ *   rockchip_drm_ops.bind   = rockchip_drm_bind   → 所有子组件就绪时调用
+ *   rockchip_drm_ops.unbind = rockchip_drm_unbind → 卸载时调用
+ *
+ * component_master_add_with_match 内部：
+ *   → 立即检查 match 列表中是否已有足够多的子组件注册（调用 component_add 的）
+ *   → 若全部就绪：当场调用 rockchip_drm_bind()，完成 DRM 设备创建
+ *   → 若部分就绪：挂起等待，每当一个新子组件注册（component_add）时
+ *                 重新检查，直到 match 列表全部满足后触发 bind
+ *
+ * ## DMA 掩码配置
+ *
+ * bind 成功后设置 coherent_dma_mask = DMA_BIT_MASK(64)，
+ * 允许 DMA 使用完整的 64 位物理地址空间，支持超过 4GB 的大内存平台。
+ * （RK3568 的 DDR 地址空间上限为 8GB）
+ *
+ * ## 完整时序图
+ *
+ *  rockchip_drm_init()
+ *    ├─ platform_register_drivers(sub_drivers)  → 注册 VOP2/DSI/HDMI 等子驱动
+ *    │    └─ 各子驱动 probe → component_add()   → 子组件就绪
+ *    └─ platform_driver_register(master_driver)
+ *         └─ rockchip_drm_platform_probe()      ← 本函数
+ *              ├─ OF 预检
+ *              ├─ rockchip_drm_match_add()       → 构建 match 列表
+ *              └─ component_master_add_with_match()
+ *                   └─ 所有子组件就绪 → rockchip_drm_bind()
+ *                        ├─ drm_dev_alloc()      → 创建 drm_device
+ *                        ├─ 各子组件 bind()      → 注册 CRTC/Encoder/Connector
+ *                        └─ drm_dev_register()   → 对用户空间开放 /dev/dri/card0
+ */
 static int rockchip_drm_platform_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct component_match *match = NULL;
 	int ret;
 
+	/*
+	 * 第一步：OF 拓扑预检。
+	 * 确认 DTS 中至少有一个可用的 VOP 端口，并确定是否使用 IOMMU 内存模式。
+	 * VVOP 模式（虚拟 VOP，用于模拟测试）跳过此检查。
+	 */
 	ret = rockchip_drm_platform_of_probe(dev);
 #if !IS_ENABLED(CONFIG_DRM_ROCKCHIP_VVOP)
 	if (ret)
 		return ret;
 #endif
 
+	/*
+	 * 第二步：扫描总线，构建子组件 match 列表。
+	 * 找不到任何子组件时返回 -ENODEV（子驱动尚未 probe，可能触发 defer）。
+	 */
 	match = rockchip_drm_match_add(dev);
 	if (IS_ERR(match))
 		return PTR_ERR(match);
 
+	/*
+	 * 第三步：注册为 component master，绑定 match 列表。
+	 * 若此时所有子组件已就绪，rockchip_drm_bind() 在本调用内同步执行；
+	 * 否则异步等待，直到最后一个子组件 component_add() 时触发绑定。
+	 * 失败时清理 device_link，防止悬空依赖。
+	 */
 	ret = component_master_add_with_match(dev, &rockchip_drm_ops, match);
 	if (ret < 0) {
 		rockchip_drm_match_remove(dev);
 		return ret;
 	}
+
+	/* 配置 64 位 DMA 掩码，支持超过 4GB 的大内存平台（RK3568 最大 8GB DDR） */
 	dev->coherent_dma_mask = DMA_BIT_MASK(64);
 
 	return 0;
