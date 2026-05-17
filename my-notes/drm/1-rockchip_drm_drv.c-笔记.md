@@ -1,4 +1,6 @@
+# 题记
 
+代码只是想法实现的途径。
 
 # component 框架简要笔记
 
@@ -2219,6 +2221,7 @@ HSYNC脉冲过后，是**行消隐期**。高速路依旧空荡，这是屏幕�
 【慢动作特写·解码与还原】
 4对差分光流冲进Bridge的入口闸门，第一站是**协议解码车间**。就像一列跑着标准轨的高铁，要进入窄轨路网，必须先把车厢全部卸下，还原成最原始的货物。
 在这里，Bridge的锁相环先锁定从Encoder传来的、与CRTC完全同源的时钟信号，再用精准的时钟快门，把串行差分信号重新解串、解码，拆开Encoder打的10位数据包，剥离出里面最核心的、从未被修改过的原始数据：
+
 - 1920x1080的RGB像素值，分毫不差；
 - HSYNC行同步、VSYNC场同步、DE数据使能信号，脉宽、周期、消隐间隔，和CRTC输出的完全一致，没有一丝一毫的改动；
 - 甚至连像素时钟的频率，都和CRTC的基准时钟1:1同源。
@@ -3624,6 +3627,554 @@ IOMMU 存在的意义之一就是**隔离**：
 | 为什么要各自建表？                  | IOVA 各自独立分配，映射关系不同；页表是隔离的硬件结构        |
 | `dma_buf_map_attachment` 做了什么？ | 在**这个设备**的 IOMMU 页表里，为这块物理内存建立条目        |
 | `CONFIG_DMABUF_CACHE` 缓存了什么？  | 缓存了建好的映射条目（`sg_table`），下次同设备再次使用时直接复用，不用重走 IOMMU 建表流程 |
+
+
+
+现在有了完整的视图，可以系统地描述整个流程了。
+
+---
+
+# 屏幕从上电到正常显示的完整流程
+
+> 提示词：我想要跟踪一次屏幕从上电到完成加载正常显示的过程，帮我说明一下需要走过的核心函数，描述的上下逻辑需要衔接，不要突兀。
+>
+> claude4.6
+
+整个过程分为两个大阶段：**内核驱动初始化**（建立软件框架）和**用户空间合成**（产生第一帧画面）。
+
+## VOP2 硬件数据通路（先建立全局认知）
+
+```
+DDR 帧缓冲
+    │
+    ▼ DMA 读取（经 IOMMU 地址翻译，或直接物理地址）
+┌──────────────────────────────────────────────────────┐
+│  VOP2                                                │
+│                                                      │
+│  Plane (Win0~Win3/Cluster/Esmart/Smart)              │
+│    → 格式转换、缩放、CSC                               │
+│    │                                                  │
+│    ▼                                                  │
+│  Overlay 混合器 (OVERLAY_LAYER_SEL)                    │
+│    → 按 zpos 叠加多个 plane                             │
+│    │                                                  │
+│    ▼                                                  │
+│  Video Port (VP0/VP1/VP2) (OVERLAY_PORT_SEL)          │
+│    → 生成显示时序（HSync/VSync/DE）、后处理              │
+│    │                                                  │
+│    ▼                                                  │
+│  接口路由 (SYS_DSP_INFACE_EN/CTRL)                     │
+│    → VP → MIPI0/HDMI0/eDP0/LVDS0/...                 │
+└──────────────────────────────────────────────────────┘
+    │
+    ▼ 像素数据 + 时序信号
+  Encoder (DSI 控制器 / HDMI 控制器 / DP 控制器)
+    → 协议编码（MIPI DSI HS / TMDS / DP 差分）
+    │
+    ▼ 物理链路
+  Connector → Panel / 外接显示器
+
+数据单向流动：DDR → VOP2 → Encoder → 屏幕
+```
+
+---
+
+## 第一阶段：模块加载 rockchip_drm_init()`
+
+内核启动时，`rockchip_drm_init()` 是一切的起点。它做两件事：
+
+**① 批量注册子驱动**（`platform_register_drivers`）
+
+将 VOP/VOP2、DSI、HDMI、DP、LVDS、RGB、TVE 等所有显示相关的子驱动逐一注册到 platform 总线（具体列表受 Kconfig 控制，`ADD_ROCKCHIP_SUB_DRIVER` 宏按编译配置动态填充 `rockchip_sub_drivers[]`）。内核发现 DTS 中有对应节点（`status = "okay"`）时，依次触发各子驱动的 probe：
+
+- `vop2_platform_driver.probe` — VOP2 控制器完成硬件初始化（时钟、中断），然后调用 `component_add()` 宣告"我已就绪"
+- `dw_mipi_dsi_driver.probe` — DSI 控制器同上，调用 `component_add()`
+- `dw_hdmi_rockchip_pltfm_driver.probe` — HDMI 控制器同上
+
+此时各子驱动只是**独立存在**，彼此之间没有任何连接，DRM 框架尚未建立。
+
+**② 注册 master 驱动**（`platform_driver_register`）
+
+随后注册 master 驱动，触发 `rockchip_drm_platform_probe()`。
+
+---
+
+## 第二阶段：Master probe: rockchip_drm_platform_probe()`
+
+这是整个显示子系统的"调度室"，按顺序做三件事：
+
+**① DTS 拓扑预检**（`rockchip_drm_platform_of_probe`）
+
+从 DTS 的 `display-subsystem` 节点出发，沿 `ports` 属性找到所有 VOP 的设备节点，确认至少一个 VOP 处于可用状态。同时检查每个 VOP 是否配置了 `iommus` 属性：只要有一个 VOP 不支持 IOMMU，全局标志 `is_support_iommu` 就降为 `false`，后续所有帧缓冲都退回到物理连续内存分配（CMA）。这里体现"短板效应"——因为 DRM framebuffer 是全局共享的，不同 VOP 的 IOMMU 能力必须统一。
+
+**② 构建子组件 match 列表**（`rockchip_drm_match_add`）
+
+扫描 platform 总线，找出所有由 `rockchip_sub_drivers[]` 管理的设备实例，构建 `component_match` 列表。这个列表是 component 框架的"点名册"——后续用它来判断"是否所有子组件都已就绪"。
+
+**③ 注册为 component master**（`component_master_add_with_match`）
+
+将自己注册为 component master，并把 match 列表交给 component 框架。框架立即核查点名册：若此刻所有子组件已完成 `component_add()`，同步调用 `rockchip_drm_bind()`；否则挂起等待，直到最后一个子组件就绪时自动触发。
+
+---
+
+## 第三阶段：全系统绑定: `rockchip_drm_bind()`
+
+这是最核心的函数，按8个阶段完成整个 DRM 设备的构建：
+
+**阶段1：创建 drm_device 骨架**（`drm_dev_alloc`）
+
+分配 `drm_device` 结构体，绑定 `rockchip_drm_driver` 操作集。这个对象是整个 DRM 子系统的顶层容器，持有所有后续 KMS 对象。
+
+**阶段2：初始化私有数据**
+
+分配 `rockchip_drm_private`，初始化：
+- `commit_lock` / `ovl_lock`：保护原子提交和 VOP2 共享 overlay 寄存器的互斥锁
+- `commit_work`：非阻塞原子提交的异步工作队列，让合成器提交后立即返回渲染下一帧
+- `devfreq`（DMC 动态内存频率）、`hdmi_pll` / `default_pll`（VOP2 像素时钟来源）
+- `psr_list`：Panel Self-Refresh 设备列表，屏幕静止时面板自刷新以省电
+
+**阶段3：初始化 IOMMU 域**（`rockchip_drm_init_iommu`）
+
+若 `is_support_iommu = true`，分配 `iommu_domain`，用 `drm_mm_init` 初始化 IOVA 地址空间分配器，并注册 page fault 回调 `rockchip_drm_fault_handler`（用于故障后诊断）。VOP2 日后的 DMA 访问都通过这个 domain 做地址翻译。
+
+**阶段4：初始化 KMS 框架**
+
+- `drm_mode_config_init`：建立 CRTC/Plane/Connector/Encoder 对象链表的基础结构
+- `rockchip_drm_mode_config_init`：设置分辨率范围上限，注册 `.fb_create`（帧缓冲创建）、`.atomic_check`、`.atomic_commit` 等核心回调
+- `rockchip_drm_create_properties`：创建 `CONNECTOR_ID` 等 Rockchip 私有 DRM 属性
+
+到这里，显示框架的"空壳"已经搭好，但里面还没有任何硬件对象。
+
+**阶段5：绑定所有子组件**（`component_bind_all`）— 关键步骤
+
+这一步调用 match 列表中每个子组件的 `.bind()` 回调，把之前独立存在的驱动们全部接入 DRM 框架：
+
+- `vop2_bind()` — 注册 `drm_crtc`（VP0/VP1/VP2）和 `drm_plane`（Win0~Win3）
+- `dw_mipi_dsi_bind()` — 注册 `drm_encoder`（DSI 信号发生器）和 `drm_connector`（DSI 接口，同时通过 `of_drm_find_panel` 找到 `drm_panel` 并 attach）
+- `dw_hdmi_bind()` — 注册 `drm_encoder`（TMDS 信号发生器）和 `drm_connector`（HDMI 接口）
+
+完成后，`mode_config` 中的 CRTC → Encoder → Connector → Panel 完整拓扑建立，整个显示流水线在软件层面连通。
+
+随即调用 `rockchip_attach_connector_property`，为所有 connector 附加亮度/对比度/饱和度等 TV 调节属性。
+
+**阶段6：VBlank 与默认状态**
+
+- `drm_vblank_init`：为每个 CRTC 分配 VBlank 管理结构（计数器、时间戳、等待队列），page flip 完成通知、fence signal 都依赖它
+- `drm_mode_config_reset`：调用每个 KMS 对象的 `.reset()` 回调，将原子状态机置为干净的初始状态
+- `rockchip_drm_set_property_default`：通过一次原子提交（`drm_atomic_commit`）将色彩属性默认值（亮度50、对比度50等）写入各 connector state
+- `drm_dev->irq_enabled = true`：允许 VBlank 中断处理函数向上层投递事件
+
+**阶段7：热插拔、GEM 池、Loader logo、fbdev**
+
+- `drm_kms_helper_poll_init`：初始化输出状态轮询（针对无 HPD 中断的接口如 VGA）
+- `rockchip_gem_pool_init`：初始化安全内存池（TEE/secure buffer），用于 HDCP 内容保护场景，防止普通进程访问受保护的视频帧缓冲
+- `show_loader_logo`（仅内建模式，`#ifndef MODULE`）：读取 uboot 遗留在内存中的 logo framebuffer 坐标，将其转换为 DRM 的 framebuffer 对象，提交一次特殊的原子操作让 VOP2 继续扫描这块内存——**这是开机画面无缝衔接的关键**，从此刻起直到合成器接管，屏幕上持续显示 uboot logo，不出现黑屏。
+- `of_reserved_mem_device_init`：将 DTS `memory-region` 中的保留内存（`drm-logo`、`drm-cubic-lut` 3D LUT 数据）关联到 drm_dev，失败时仅打印 debug 日志不影响主流程
+- `rockchip_drm_fbdev_init`：创建 `/dev/fb0` 兼容层，供旧式应用使用；完成后对所有支持热插拔的 CRTC（HDMI/DP/DVI/TV 等）对应的 fbdev framebuffer 额外增加一次引用计数，防止 HDMI 热插拔时 `/dev/fb0` 的 buffer 被意外释放
+- `drm_dev->mode_config.allow_fb_modifiers = true`：允许 AFBC 压缩格式帧缓冲，VOP2 可直接解压扫描 GPU 输出的 tile buffer，降低 30~50% 的 DDR 带宽占用
+
+**阶段8：对外开门**（`drm_dev_register`）
+
+创建 `/dev/dri/card0` 和 `/dev/dri/renderD128` 字符设备节点。从这一刻起，用户空间可以 `open()` 并通过 ioctl 与 DRM 交互。
+
+---
+
+## 第四阶段：用户空间合成器接管
+
+`drm_dev_register` 返回后，udev 规则触发，合成器（如 weston 或 Android SurfaceFlinger）检测到 `/dev/dri/card0` 出现，开始工作：
+
+**① 探测显示器**（`DRM_IOCTL_MODE_GETCONNECTOR`）
+
+调用 connector 的 `.fill_modes()` 回调：DSI connector 调用 `drm_panel_get_modes()` 读取 Panel 驱动硬编码的分辨率列表；HDMI connector 通过 DDC 总线读取外接显示器的 EDID，获取其支持的所有模式。
+
+**② 建立显示管线**（`DRM_IOCTL_MODE_ATOMIC`）
+
+合成器选定 mode（如 1080p@60Hz），分配 framebuffer，提交第一次原子 commit。内核侧执行流如下：
+
+**atomic_check**：调用各 CRTC/Plane/Connector 的 `.atomic_check()` 回调，验证状态组合是否合法（分辨率、格式、带宽等）。
+
+**atomic_commit → commit_tail**：检查通过后，进入 `rockchip_atomic_helper_commit_tail_rpm()`（`rockchip_drm_fb.c`），这是硬件真正开始工作的地方。按源码顺序，它做7件事：
+
+```
+rockchip_atomic_helper_commit_tail_rpm(old_state)
+{
+    ① rockchip_drm_psr_inhibit_get_state  — 禁止 PSR，确保更新期间面板不自刷新
+    ② drm_atomic_helper_commit_modeset_disables — 禁用旧管线（若有切换）
+    ③ drm_atomic_helper_commit_modeset_enables  — 开启新管线（核心，见下）
+    ④ drm_atomic_helper_commit_planes           — 写入 plane 配置（DMA 地址、格式）
+    ⑤ rockchip_drm_psr_inhibit_put_state  — 恢复 PSR
+    ⑥ drm_atomic_helper_commit_hw_done    — 标记硬件提交完成，signal fence
+    ⑦ rockchip_drm_atomic_helper_wait_for_vblanks — 等待 VBlank 确认生效
+}
+```
+
+其中③和④是出图的关键，展开如下：
+
+**③ `drm_atomic_helper_commit_modeset_enables`** — 开启显示管线
+
+该函数（`drm_atomic_helper.c`）内部是两个 `for_each` 循环，严格按先 CRTC 后 Encoder 的顺序执行：
+
+- 循环1：`for_each_oldnew_crtc_in_state` — 遍历本次提交中所有需要 modeset 的 CRTC，调用 `funcs->atomic_enable()`
+- 循环2：`for_each_new_connector_in_state` — 遍历本次提交中所有激活的 connector，找到其 encoder，调用 `funcs->enable()`
+
+循环1 **整体跑完**之后才开始跑循环2——先让所有 CRTC（VOP2）上电产生时序，再让所有 Encoder 对接这些时序。单屏场景每个循环只迭代一次；双屏（VP0→DSI + VP1→HDMI）时循环1 连续使能两个 VP，循环2 连续使能两个 encoder。
+
+**循环1：使能 CRTC** → `funcs->atomic_enable()` → `vop2_crtc_atomic_enable()`
+
+这是 VOP2 硬件上电并开始产生时序信号的全过程：
+
+1. `vop2_initial()`：首个 VP 开启时触发 VOP2 全局初始化
+   - `pm_runtime_get_sync` → VOP2 电源域上电
+   - `vop2_core_clks_prepare_enable` → aclk/hclk 使能
+   - 备份寄存器、配置 overlay 路由立即生效模式
+2. `clk_prepare_enable(vp->dclk)` → 使能 Video Port 像素时钟
+3. 配置**接口路由**：根据 `output_if` 将当前 VP 路由到目标输出接口
+   - 例如 MIPI：`mipi0_en=1, mipi0_mux=vp_id`
+   - 例如 HDMI：`hdmi0_en=1, hdmi0_mux=vp_id`
+4. 配置**输出模式**（P888/P666/YUV420）和数据交换
+5. 写入**显示时序寄存器**：htotal_pw、hact_st_end、vact_st_end、vtotal_pw
+6. `clk_set_rate(vp->dclk, pixel_clock)` → 设置像素时钟频率（如 148.5MHz@1080p60）
+7. `vop2_post_config()` → 后处理配置（缩放、裁剪）
+8. `vop2_cfg_done()` → 提交所有寄存器修改（cfg_done 生效）
+9. **清除 standby 位** → VP 立即开始按配置的时序扫描输出（这一步之后 VOP2 已经在向 encoder 发送时序信号了，但因为 plane 尚未配置，发送的是黑色/背景色）
+10. `drm_crtc_vblank_on()` → 开启 VBlank 中断
+
+**循环2：使能 Encoder** → 调用 encoder 的 `.enable()` 回调
+
+以 DSI 路径（`dw_mipi_dsi_encoder_enable`）为例：
+
+1. 计算并配置 DSI PHY 的 HS 时钟 lane rate
+2. `dw_mipi_dsi_vop_routing()` → 配置 GRF 寄存器，将 VOP 输出路由到此 DSI 控制器
+3. **RK3568 特殊处理**：`vop2_standby(crtc, 1)` — 暂时将 VOP2 置为 standby，避免在 DSI 初始化期间发送无效数据
+4. `dw_mipi_dsi_pre_enable()` → DSI 控制器上电，进入 LP（低功耗）命令模式
+5. `drm_panel_prepare()` → **面板硬件上电序列**：regulator enable → reset GPIO toggle → 通过 DSI LP 命令通道发送面板初始化序列
+6. `dw_mipi_dsi_enable()` → DSI 控制器切换到 HS（高速）Video 模式，开始以高速差分信号传输像素数据
+7. **RK3568 特殊处理**：`vop2_standby(crtc, 0)` — 释放 standby，VOP2 像素数据开始流向 DSI
+8. `drm_panel_enable()` → **开启背光**，用户看到画面
+
+**④ `drm_atomic_helper_commit_planes`** — 写入 plane（图层）配置
+
+遍历所有状态变化的 plane，调用 `vop2_plane_atomic_update()`：
+- 写入 framebuffer 的 DMA 地址（IOMMU 映射后的 IOVA 或物理地址）
+- 配置像素格式、stride、源/目标矩形（位置与缩放）
+- 配置 overlay 层叠顺序（zpos）
+- `vop2_cfg_done()` → VOP2 在下一个 VBlank 开始从该 DMA 地址读取像素数据并扫描输出
+
+至此，第一帧画面出现在屏幕上。
+
+**③ 持续渲染**
+
+GPU 渲染每帧，通过 `DRM_IOCTL_MODE_PAGE_FLIP` 或原子提交在 VBlank 期间切换 framebuffer，VOP2 在下一个 VBlank 开始扫描新帧，屏幕上出现连续的 UI 画面。
+
+至此，从内核上电到屏幕正常显示的全流程完成。
+
+
+
+## 大脑放映示例
+
+> 提示词：代替我的大脑来过一遍
+>
+> opus4.6
+
+好，我现在闭上眼，用笔记里的信息，在脑海里从头到尾放一遍电影。
+
+---
+
+**开机。内核开始执行 `module_init`。**
+
+`rockchip_drm_init()` 被调用。它做的第一件事，是把一堆子驱动——VOP2、DSI、HDMI 等等——往 platform 总线上注册。内核扫描设备树，发现有 `status = "okay"` 的节点跟这些驱动匹配，就依次触发它们的 probe。
+
+VOP2 的 probe 跑了，初始化了自己的时钟和中断，但它不急着跟谁对接，只是喊了一声 `component_add()`——"我到了"。DSI 控制器的 probe 也跑了，同样喊了一声"我到了"。HDMI 控制器也一样。
+
+此时这些驱动**各自独立存在**，像一群站在操场上的人，互相不认识，也没有任何 DRM 框架把它们连起来。
+
+紧接着 `rockchip_drm_init()` 注册了 master 驱动，触发了 `rockchip_drm_platform_probe()`。
+
+---
+
+**调度室开始工作。**
+
+`rockchip_drm_platform_probe()` 是协调者。它先做一次 DTS 预检——从 `display-subsystem` 节点出发，顺着 `ports` 找到所有 VOP 节点，确认至少有一个能用。同时检查每个 VOP 有没有 `iommus` 属性。这里有个"短板效应"：只要有一个 VOP 不带 IOMMU，全局就退回 CMA 物理连续分配，因为帧缓冲是全局共享的。
+
+然后它扫描 platform 总线，把所有由 `rockchip_sub_drivers[]` 管理的设备实例收集起来，构建一个 `component_match` 列表——点名册。
+
+最后调用 `component_master_add_with_match()`，把自己注册为 master，并把点名册交给 component 框架。框架一核对：VOP2 到了吗？到了。DSI 到了吗？到了。HDMI 到了吗？到了。全到了——立即同步调用 `rockchip_drm_bind()`。
+
+---
+
+**全系统绑定开始，这是最核心的函数。**
+
+`drm_dev_alloc()` 分配出 `drm_device`，绑定 `rockchip_drm_driver` 操作集。这是整个 DRM 子系统的顶层容器，后面所有东西都挂在它下面。
+
+然后分配 `rockchip_drm_private`，初始化两把互斥锁（`commit_lock` 保护原子提交、`ovl_lock` 保护 VOP2 共享 overlay 寄存器）、异步提交工作队列、DMC 内存频率调节句柄、HDMI PLL 和默认 PLL 时钟句柄、PSR 设备列表。基础设施就位。
+
+如果 IOMMU 被支持，`rockchip_drm_init_iommu()` 分配 `iommu_domain`，初始化 IOVA 地址空间分配器。以后 VOP2 的 DMA 读帧缓冲走 IOMMU 翻译，不需要物理连续内存。
+
+接着初始化 KMS 框架——`drm_mode_config_init()` 搭起对象链表的骨架，`rockchip_drm_mode_config_init()` 填入分辨率范围和 `.atomic_check`、`.atomic_commit` 等回调，`rockchip_drm_create_properties()` 创建私有属性。到这里，框架是个空壳——有链表，但没有任何硬件对象挂在上面。
+
+**关键一步来了：`component_bind_all()`。**
+
+framework 遍历点名册，挨个调用每个子组件的 `.bind()` 回调：
+
+- `vop2_bind()` 跑了——往 `mode_config` 里注册了 `drm_crtc`（VP0/VP1/VP2）和 `drm_plane`（Win0~Win3）。
+- `dw_mipi_dsi_bind()` 跑了——注册了 `drm_encoder` 和 `drm_connector`，同时 `of_drm_find_panel` 找到了设备树里对应的 panel 驱动并 attach。
+- `dw_hdmi_bind()` 跑了——同样注册了 encoder 和 connector。
+
+刚才操场上互不相识的人，现在全部被编入了组织。`mode_config` 里的 CRTC → Plane → Encoder → Connector → Panel 拓扑完整建立。紧接着 `rockchip_attach_connector_property()` 给所有 connector 挂上亮度/对比度/饱和度属性。
+
+然后 `drm_vblank_init()` 为每个 CRTC 分配 VBlank 管理结构；`drm_mode_config_reset()` 把所有 KMS 对象的原子状态机清到初始值；`rockchip_drm_set_property_default()` 通过一次原子提交把色彩属性默认值（brightness=50, contrast=50...）写入 connector state；`irq_enabled = true` 开放 VBlank 中断。
+
+`drm_kms_helper_poll_init()` 初始化热插拔轮询。`rockchip_gem_pool_init()` 初始化安全内存池。**`show_loader_logo()`**——如果是内建模式——读取 uboot 留在内存中的 logo 帧缓冲，把它包装成 DRM framebuffer 对象，提交一次原子操作让 VOP2 继续扫描这块内存。**此刻屏幕上显示的是 uboot logo，不会黑屏。** 然后关联保留内存、初始化 fbdev 兼容层、开启 AFBC modifier 支持。
+
+**`drm_dev_register()`——对外开门。**
+
+`/dev/dri/card0` 和 `/dev/dri/renderD128` 出现在文件系统中。用户空间可以来了。
+
+---
+
+**合成器登场。**
+
+udev 规则触发，weston 或 SurfaceFlinger 发现了 `/dev/dri/card0`，`open()` 它。
+
+**第一件事：探测显示器。** 发 `DRM_IOCTL_MODE_GETCONNECTOR`，走到 connector 的 `.fill_modes()` 回调。DSI connector 调 `drm_panel_get_modes()`，panel 驱动返回硬编码的分辨率列表（比如 1080x1920@60Hz）。HDMI connector 则通过 DDC 总线读 EDID，拿到外接显示器支持的所有模式。
+
+**第二件事：建立显示管线。** 合成器选了一个 mode，分配好 framebuffer，发 `DRM_IOCTL_MODE_ATOMIC` 提交第一次原子 commit。
+
+内核侧先跑 `atomic_check`——各 CRTC/Plane/Connector 的检查回调验证状态组合合法性。通过了。
+
+然后进入 `rockchip_atomic_helper_commit_tail_rpm()`，**硬件真正开始动了**：
+
+先禁止 PSR（别让面板在更新中途自刷新）。然后 `commit_modeset_disables`（如果有旧管线要关，先关掉）。
+
+接着 **`commit_modeset_enables`**，分两个循环：
+
+**循环1：使能 CRTC。** 调用 `vop2_crtc_atomic_enable()`。
+
+`vop2_initial()` 触发：`pm_runtime_get_sync()` 让 VOP2 电源域上电，`vop2_core_clks_prepare_enable()` 使能 aclk/hclk，备份寄存器，配置 overlay 路由立即生效模式。然后使能 VP 的像素时钟 `dclk`。
+
+配置接口路由——比如要走 MIPI 输出，就写 `mipi0_en=1, mipi0_mux=vp_id`，把这个 VP 的输出指向 MIPI0 接口。
+
+配置输出模式（P888）、写入显示时序寄存器（htotal、hact_st_end、vact_st_end、vtotal...）、设置像素时钟频率（比如 148.5MHz）、配置后处理。
+
+`vop2_cfg_done()` 提交所有寄存器修改。**然后清除 standby 位——VP 立即开始按这些时序扫描输出。** 但此刻 plane 还没配置，VOP2 向 encoder 发送的是黑色/背景色。最后 `drm_crtc_vblank_on()` 开启 VBlank 中断。
+
+**循环2：使能 Encoder。** 以 DSI 路径为例，调用 `dw_mipi_dsi_encoder_enable()`。
+
+先计算 DSI PHY 的 HS 时钟 lane rate，配置 GRF 路由让 VOP 输出到这个 DSI 控制器。
+
+**RK3568 关键协调：** `vop2_standby(crtc, 1)` 把 VOP2 重新置入 standby——刚才 CRTC enable 清掉的 standby 被重新设上，防止在 DSI 初始化期间发送无效数据。
+
+`dw_mipi_dsi_pre_enable()` 让 DSI 控制器上电，进入 LP 命令模式。
+
+**`drm_panel_prepare()`——面板开始上电：** regulator enable → reset GPIO toggle → 通过 DSI LP 命令通道发送面板初始化序列（那些厂商私有的 init code）。
+
+`dw_mipi_dsi_enable()` 让 DSI 控制器从 LP 切换到 **HS Video 模式**，高速差分信号开始跑了。
+
+**RK3568 关键协调：** `vop2_standby(crtc, 0)` 释放 standby——VOP2 的像素数据正式流向 DSI 控制器，通过差分线送到面板。
+
+**`drm_panel_enable()`——背光打开。** 但此刻 plane 还没写，屏幕显示的依然是黑色。
+
+**然后 `commit_planes` 来了。** 遍历所有变化的 plane，调用 `vop2_plane_atomic_update()`：把 framebuffer 的 DMA 地址写进去，配置像素格式、stride、源/目标矩形、overlay 层叠顺序，最后 `vop2_cfg_done()`。VOP2 在**下一个 VBlank** 开始从这个 DMA 地址读取像素数据。
+
+**第一帧画面出现在屏幕上。**
+
+恢复 PSR。`commit_hw_done()` signal fence 告诉合成器硬件提交完成了。`wait_for_vblanks` 等一个 VBlank 确认生效。
+
+---
+
+**从此以后，** GPU 不断渲染新帧，合成器通过 page flip 或原子提交在 VBlank 间隙切换 framebuffer 地址，VOP2 在每个 VBlank 开始扫描新的 DMA 地址。60Hz 的节奏下，每 16.67ms 一帧，屏幕上出现流畅的 UI 画面。
+
+**全流程完毕。**
+
+---
+
+# drm_driver.driver_features 能力位掩码
+
+填入 `drm_driver.driver_features`，向 DRM 核心声明本驱动支持哪些特性。
+DRM 核心在设备注册、ioctl 分发、sysfs 暴露等阶段检查此掩码，据此决定是否开放对应功能给用户空间。
+
+**Rockchip DRM 驱动的实际配置：**
+```c
+.driver_features = DRIVER_MODESET | DRIVER_GEM |
+                   DRIVER_PRIME | DRIVER_ATOMIC | DRIVER_RENDER,
+```
+
+标志按历史时代分为两组：
+- ① 旧时代 PC GPU 标志（`0x1~0x80`）：AGP/PCI DMA/中断相关，现代 ARM 驱动基本不用
+- ② 现代 KMS/GEM 标志（`0x1000+`）：当代嵌入式/移动显示驱动的标准配置
+
+---
+
+### 旧时代标志（AGP 时代遗留，现代驱动通常不使用）
+
+| 宏 | 值 | 说明 |
+|---|---|---|
+| `DRIVER_USE_AGP` | `0x1` | 声明使用 AGP（Accelerated Graphics Port）总线。AGP 是 1990 年代 x86 PC 显卡专用总线，早已被 PCIe 取代，ARM 平台完全无关。 |
+| `DRIVER_LEGACY` | `0x2` | 声明使用旧式 UMS（User Mode Setting）模式。KMS 引入（2009 年）之前，显示模式设置在用户空间完成（X server 直接操作硬件）。现代驱动一律使用 KMS，不应设置此标志。 |
+| `DRIVER_PCI_DMA` | `0x8` | 声明使用旧式 PCI DMA 接口。已被 GEM/CMA 等现代内存管理替代。 |
+| `DRIVER_SG` | `0x10` | 声明使用 Scatter-Gather DMA。用于将非连续物理内存映射为连续 GART 地址，现代驱动由 IOMMU 和 GEM 负责，此标志已废弃。 |
+| `DRIVER_HAVE_DMA` | `0x20` | 声明需要旧式 DRM DMA 缓冲区管理，现代驱动不使用。 |
+| `DRIVER_HAVE_IRQ` | `0x40` | 声明通过 `drm_driver.irq_handler` 注册中断。DRM 核心据此在注册时调用 `drm_irq_install()`。现代驱动通常自己用 `request_irq()`，不依赖此机制。 |
+| `DRIVER_IRQ_SHARED` | `0x80` | 声明 IRQ 线可与其他设备共享（`IRQF_SHARED`），配合 `DRIVER_HAVE_IRQ` 使用。 |
+
+---
+
+### 现代标志（KMS/GEM 时代，当前驱动的标准配置）
+
+#### `DRIVER_GEM`（`0x1000`）
+
+声明驱动使用 GEM（Graphics Execution Manager）内存管理。
+
+GEM 是 Linux 内核统一的 GPU/显示内存管理框架，提供：
+- 帧缓冲、纹理、命令缓冲等显示内存对象（GEM Object）的分配/释放
+- 用户空间通过 fd（文件描述符）引用内存对象（GEM handle → fd）
+- 跨进程共享：用户空间 open/close/mmap GEM 对象
+
+设置后，DRM 核心暴露 `DRM_IOCTL_GEM_CLOSE` / `DRM_IOCTL_GEM_FLINK` / `DRM_IOCTL_GEM_OPEN` 等 ioctl，并为每个 `drm_file` 初始化 GEM handle 表（idr）。
+
+几乎所有现代显示驱动都需要设置。Rockchip 使用 CMA（连续内存分配器）作为 GEM 后端（`rockchip_gem_*`）。
+
+---
+
+#### `DRIVER_MODESET`（`0x2000`）
+
+声明驱动支持 KMS（Kernel Mode Setting，内核模式设置）。
+
+KMS 将显示模式配置（分辨率、刷新率、颜色深度等）从用户空间移入内核，由驱动直接操作硬件寄存器完成：
+- **安全**：避免用户空间直接操作硬件
+- **统一**：内核统一管理多显示器配置
+- **快速切换**：控制台/X/Wayland 切换时不再黑屏
+
+设置后，DRM 核心暴露 `DRM_IOCTL_MODE_*` ioctl，创建 `/dev/dri/card0` 设备节点，允许驱动注册 `drm_crtc` / `drm_encoder` / `drm_connector` / `drm_plane` 等 KMS 对象。嵌入式/移动显示驱动必须设置。
+
+---
+
+#### `DRIVER_PRIME`（`0x4000`）
+
+声明驱动支持 PRIME（基于 DMA-BUF 的跨设备缓冲区共享）。
+
+允许不同设备的驱动之间共享 GPU/显示内存，无需数据拷贝：
+- GPU 渲染结果 → 导出为 DMA-BUF fd → 导入到 VOP2 直接显示（zero-copy）
+- Camera 采集帧 → 导出为 DMA-BUF fd → 导入到 GPU 处理 → 导入到 VOP2 显示
+
+实现两个方向：
+- `drm_driver.prime_handle_to_fd`：GEM handle → DMA-BUF fd（导出）
+- `drm_driver.prime_fd_to_handle`：DMA-BUF fd → GEM handle（导入）
+
+设置后暴露 `DRM_IOCTL_PRIME_HANDLE_TO_FD` / `DRM_IOCTL_PRIME_FD_TO_HANDLE` ioctl。现代多媒体流水线（摄像头/GPU/显示）必须支持。
+
+---
+
+#### `DRIVER_RENDER`（`0x8000`）
+
+声明驱动支持独立的 Render 节点（`/dev/dri/renderD128` 等）。
+
+Render 节点与 KMS 节点（`/dev/dri/card0`）分离，专门用于 GPU 计算/渲染，无需显示权限：
+- 访问 `/dev/dri/card0` 需要 DRM master 权限，用于 KMS 操作
+- 访问 `/dev/dri/renderD*` 无需特权，任何进程都可以提交 GPU 作业
+
+GPU 渲染（OpenGL/Vulkan/OpenCL）与显示控制解耦，提升安全性。Rockchip 驱动虽然是显示驱动，但也设置了此标志以兼容部分合成器的需求。
+
+---
+
+#### `DRIVER_ATOMIC`（`0x10000`）⭐ 最重要
+
+声明驱动支持原子模式设置（Atomic Modesetting）。
+
+将 CRTC/Plane/Connector 的多个状态变更打包为一个原子操作，要么全部在同一个 VBlank 内生效，要么全部回滚。
+
+**硬件前提——缺一不可：**
+
+**① 双缓冲（Shadow）寄存器机制（最关键的硬件设计）**
+
+先理解 VOP2 的工作方式：VOP2 每帧持续扫描屏幕，以 1080p60 为例每帧约 16ms，扫描期间每隔几纳秒就从寄存器读一次"fb 地址/宽高/格式"来决定下一行取哪里的像素。CPU 配置一帧需要写几十个寄存器，全部写完需要几微秒——VOP2 在这几微秒里已经扫了好几行像素。
+
+**没有双缓冲时的问题（寄存器写即生效）：**
+
+```
+CPU 写第1个寄存器：fb_addr = 新地址      ← 硬件立刻用新地址
+CPU 写第2个寄存器：fb_width = 新宽度     ← 硬件立刻用新宽度
+... VOP2 此刻正在扫描屏幕第 300 行 ...
+    它用的是"新地址 + 旧高度 + 旧格式"的混合状态 → 花屏/撕裂
+CPU 写第3个寄存器：fb_height = 新高度
+CPU 写第4个寄存器：fb_format = 新格式
+
+屏幕上第 1~300 行：用旧配置扫出来的
+屏幕上第 301行以后：用新旧混合配置扫出来的  ← 这就是"撕裂线"
+```
+
+**有双缓冲时的解决方案（VOP2 的实际设计）：**
+
+VOP2 为每个配置寄存器维护两套副本：
+- **影子寄存器**（Shadow Register）：CPU 写的目标，改动不立即生效
+- **工作寄存器**（Active Register）：VOP2 扫描时实际读的，始终保持完整一致
+
+CPU 可以随时写影子寄存器，VOP2 视而不见，继续用工作寄存器扫当前帧。CPU 写完所有参数后调用 `vop2_cfg_done()` 写 `REG_CFG_DONE` 寄存器，告诉 VOP2"我改完了，下一帧请用新配置"。
+
+VOP2 扫完当前帧最后一行像素进入 VBlank（消隐期，不扫描任何像素），在这个安全窗口内硬件执行一次原子锁存：所有影子寄存器同时覆盖所有工作寄存器。下一帧全帧使用完整新配置，无撕裂。
+
+```
+时间线（有双缓冲）：
+  CPU 逐个写影子寄存器（几微秒）← VOP2 看不到，继续扫旧帧
+  CPU 调用 vop2_cfg_done()
+  VOP2 扫完当前帧 → 进入 VBlank
+  ↓ 原子锁存：影子 → 工作（几纳秒内全部完成）
+  VOP2 开始扫新帧 → 全帧使用完整新配置，无撕裂
+```
+
+没有此机制的硬件（寄存器写即生效）无法实现真正的原子提交，撕裂问题在硬件层面就无解，软件无法绕过。
+
+**② VBlank 中断**
+
+驱动需要知道"新配置已经生效"的确切时刻，以便：
+- 释放旧 framebuffer（此时硬件已不再扫描旧 fb）
+- 向合成器发送 page-flip 完成事件（`DRM_EVENT_FLIP_COMPLETE`）
+- 触发下一帧的提交
+
+**软件要求——驱动必须实现的回调：**
+
+| 回调位置 | 函数（VOP2 实现） | 实际做什么 |
+|---|---|---|
+| `drm_mode_config_funcs` | `.atomic_check` | 驱动框架层总入口：依次调用每个 CRTC/Plane 的 atomic_check，全部通过才允许 commit |
+| `drm_mode_config_funcs` | `.atomic_commit` | 将通过检查的新状态交给硬件，Rockchip 走 `rockchip_atomic_helper_commit_tail_rpm` |
+| `drm_crtc_helper_funcs` | `.atomic_check`→`vop2_crtc_atomic_check` | **这个回调解决的是跨 Plane 的整体合法性问题**。`plane_atomic_check` 只能看到单个 Plane 自己的参数（大小/格式/缩放比），但有些问题只有把所有 Plane 放在一起看才能发现：① **DDR 带宽预算**：所有激活的 Plane 合计从 DDR 读像素的速率，是否超过 AXI 总线带宽上限——单看某个 Plane 完全合法，但 5 个 4K Plane 同时开就超带宽了。② **zpos 碰撞**：两个 Plane 叠加顺序（z-order）相同，硬件无法处理。③ **AFBC 跨 Plane 兼容性**：某些 Win 组合同时开 AFBC 时存在硬件限制。④ **HDR/SDR 混合规则**：如 HDR 视频层 + SDR UI 层同时存在时，需要决定是否要做 HDR→SDR tone mapping。⑤ **同时激活的 Plane 数量**超出硬件 Layer 数量上限。参考：旧版 VOP1 驱动（`rockchip_drm_vop.c`）在此函数中做了 AFBC 检查、HDR 检查、CSC 检查、zpos 排序检查。**RK3568 的 VOP2 驱动目前此函数直接 `return 0`**，上述检查被分散到 `atomic_begin` 阶段或依赖硬件自身容错，暂无集中的跨 Plane 拒绝逻辑。 |
+| `drm_crtc_helper_funcs` | `.atomic_begin`→`vop2_crtc_atomic_begin` | 帧开始前：处理 Win 跨 VP 移动、更新 layer-port 路由寄存器 |
+| `drm_crtc_helper_funcs` | `.atomic_flush`→`vop2_crtc_atomic_flush` | 所有 Plane 的寄存器都写完后，调用 `vop2_cfg_done()` 触发硬件在下一个 VBlank 锁存全部影子寄存器 |
+| `drm_plane_helper_funcs` | `.atomic_check`→`vop2_plane_atomic_check` | 写寄存器前的合法性判断，**若不合法直接返回错误、整次 commit 回滚**。具体检查：① 旋转组合是否合法（不能同时 90°+270°）② 源矩形/目标矩形是否在硬件缩放比例范围内（最小 1/8x，最大 8x）③ 尺寸不小于硬件最小值（4×4 像素）④ 尺寸不超过硬件最大输入宽高 ⑤ 像素格式驱动是否支持 ⑥ Cluster Win 在某些 SoC 上只支持 AFBC 格式，传普通 linear 格式要拒绝 ⑦ YUV 格式的 x 起始位置必须偶对齐 |
+| `drm_plane_helper_funcs` | `.atomic_update`→`vop2_plane_atomic_update` | 把通过检查的参数写进影子寄存器：DMA 地址、像素格式、stride、src/dst 矩形、zpos 叠加顺序、alpha 混合模式、旋转/翻转配置等 |
+| `drm_plane_helper_funcs` | `.atomic_disable`→`vop2_plane_atomic_disable` | 向影子寄存器写"关闭此 Win"，等 VBlank 后该图层从屏幕消失 |
+
+现代合成器（Wayland/Android SurfaceFlinger）必须依赖此特性，Rockchip 驱动必须设置。
+
+---
+
+#### `DRIVER_KMS_LEGACY_CONTEXT`（`0x20000`）
+
+为旧式 OpenGL 上下文兼容保留（旧版 X11/Mesa/GLX）。现代 Wayland + Vulkan/EGL 不需要。新驱动不应设置。
+
+---
+
+#### `DRIVER_SYNCOBJ`（`0x40000`）
+
+声明驱动支持 DRM Sync Object（同步对象）。
+
+DRM Sync Object 是 DRM 框架提供的用户空间可见的 fence 句柄，内核侧基于 `dma_fence`，可绑定到任意异步操作完成事件，支持 Timeline 模式（适合 Vulkan Timeline Semaphore）。
+
+**无硬件前提，纯软件框架特性。** 驱动设置此标志即可，DRM 核心暴露对应 ioctl。
+
+**Rockchip VOP2 不设置的原因：**
+- SYNCOBJ 主要用于 GPU 渲染驱动向合成器暴露"这帧 GPU 渲染完成"的 fence
+- VOP2 是纯显示控制器，自身无 GPU 渲染工作负载
+- VOP2 的"帧完成"通过 DRM page-flip 事件（基于 VBlank 中断）通知合成器，不需要 syncobj
+- GPU 驱动（如 panfrost）创建 syncobj → 合成器在原子提交时附带此 fence（`IN_FENCE_FD` 属性）→ VOP2 通过 `drm_atomic_helper` 的 fence 等待机制隐式参与，无需自己声明
+
+---
+
+#### `DRIVER_PREFER_XBGR_30BPP`（`0x80000`）
+
+驱动偏好 XBGR 30bpp（10 位色深）格式。设置后，DRM 核心在 fbdev emulation 层初始化 framebuffer 时优先尝试 `XBGR2101010`（每通道 10bit，总 30bpp）格式，适用于支持 HDR 的高色深显示硬件。Rockchip 驱动目前不设置。
+
+
 
 # =================
 
